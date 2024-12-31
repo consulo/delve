@@ -11,6 +11,8 @@ jobs:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
+    - name: install go
+      run: brew install go
     - name: build
       run: go run _scripts/make.go build
     - uses: actions/upload-artifact@v4
