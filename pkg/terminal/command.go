@@ -7,6 +7,7 @@ package terminal
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"go/parser"
@@ -19,6 +20,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,14 +103,6 @@ var (
 	// and limiting struct fields loaded to 3.
 	ShortLoadConfig = api.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
 )
-
-// byFirstAlias will sort by the first
-// alias of a command.
-type byFirstAlias []command
-
-func (a byFirstAlias) Len() int           { return len(a) }
-func (a byFirstAlias) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byFirstAlias) Less(i, j int) bool { return a[i].aliases[0] < a[j].aliases[0] }
 
 // DebugCommands returns a Commands struct with default commands defined.
 func DebugCommands(client service.Client) *Commands {
@@ -688,7 +682,9 @@ Currently, rev next, step, step-instruction and stepout commands are supported.`
 			})
 	}
 
-	sort.Sort(byFirstAlias(c.cmds))
+	slices.SortFunc(c.cmds, func(a, b command) int {
+		return strings.Compare(a.aliases[0], b.aliases[0])
+	})
 	return c
 }
 
@@ -814,12 +810,6 @@ func (c *Commands) help(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-type byThreadID []*api.Thread
-
-func (a byThreadID) Len() int           { return len(a) }
-func (a byThreadID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byThreadID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func threads(t *Term, ctx callContext, args string) error {
 	threads, err := t.client.ListThreads()
 	if err != nil {
@@ -829,7 +819,7 @@ func threads(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	sort.Sort(byThreadID(threads))
+	slices.SortFunc(threads, func(a, b *api.Thread) int { return cmp.Compare(a.ID, b.ID) })
 	done := false
 	t.stdout.pw.PageMaybe(func() { done = false })
 	for _, th := range threads {
@@ -879,12 +869,6 @@ func thread(t *Term, ctx callContext, args string) error {
 	fmt.Fprintf(t.stdout, "Switched from %s to %s\n", oldThread, newThread)
 	return nil
 }
-
-type byGoroutineID []*api.Goroutine
-
-func (a byGoroutineID) Len() int           { return len(a) }
-func (a byGoroutineID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byGoroutineID) Less(i, j int) bool { return a[i].ID < a[j].ID }
 
 func (c *Commands) printGoroutines(t *Term, ctx callContext, indent string, gs []*api.Goroutine, fgl api.FormatGoroutineLoc, flags api.PrintGoroutinesFlags, depth int, cmd string, pdone *bool, state *api.DebuggerState) error {
 	for _, g := range gs {
@@ -961,7 +945,7 @@ func (c *Commands) goroutines(t *Term, ctx callContext, argstr string) error {
 				fmt.Fprintf(t.stdout, "Too many groups\n")
 			}
 		} else {
-			sort.Sort(byGoroutineID(gs))
+			slices.SortFunc(gs, func(a, b *api.Goroutine) int { return cmp.Compare(a.ID, b.ID) })
 			err = c.printGoroutines(t, ctx, "", gs, fgl, flags, depth, cmd, &done, state)
 			if err != nil {
 				return err
@@ -1741,19 +1725,12 @@ func toggle(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-// byID sorts breakpoints by ID.
-type byID []*api.Breakpoint
-
-func (a byID) Len() int           { return len(a) }
-func (a byID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func breakpoints(t *Term, ctx callContext, args string) error {
 	breakPoints, err := t.client.ListBreakpoints(args == "-a")
 	if err != nil {
 		return err
 	}
-	sort.Sort(byID(breakPoints))
+	slices.SortFunc(breakPoints, func(a, b *api.Breakpoint) int { return cmp.Compare(a.ID, b.ID) })
 	for _, bp := range breakPoints {
 		enabled := "(enabled)"
 		if bp.Disabled {
@@ -1983,22 +1960,32 @@ func tracepoint(t *Term, ctx callContext, args string) error {
 	return err
 }
 
-func getEditorName() (string, error) {
+func getEditorName() (string, []string, error) {
 	var editor string
 	if editor = os.Getenv("DELVE_EDITOR"); editor == "" {
 		if editor = os.Getenv("EDITOR"); editor == "" {
-			return "", errors.New("Neither DELVE_EDITOR or EDITOR is set")
+			return "", nil, errors.New("Neither DELVE_EDITOR or EDITOR is set")
 		}
 	}
-	return editor, nil
+
+	editorParts := strings.Fields(editor)
+	editor = editorParts[0]
+
+	var userArgs []string
+	if len(editorParts) > 1 {
+		userArgs = editorParts[1:]
+	}
+
+	return editor, userArgs, nil
 }
 
 func runEditor(args ...string) error {
-	editor, err := getEditorName()
+	editor, userArgs, err := getEditorName()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(editor, args...)
+	allArgs := append(userArgs, args...)
+	cmd := exec.Command(editor, allArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -2010,13 +1997,15 @@ func edit(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	editor, err := getEditorName()
+	editor, _, err := getEditorName()
 	if err != nil {
 		return err
 	}
 	switch editor {
 	case "code":
 		return runEditor("--goto", fmt.Sprintf("%s:%d", file, lineno))
+	case "zed":
+		return runEditor(fmt.Sprintf("%s:%d:0", file, lineno))
 	case "hx":
 		return runEditor(fmt.Sprintf("%s:%d", file, lineno))
 	case "vi", "vim", "nvim":

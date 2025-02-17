@@ -2,6 +2,7 @@ package proc
 
 import (
 	"bytes"
+	"cmp"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	pdwarf "github.com/go-delve/delve/pkg/dwarf"
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -127,11 +129,12 @@ var (
 
 var (
 	supportedLinuxArch = map[elf.Machine]bool{
-		elf.EM_X86_64:  true,
-		elf.EM_AARCH64: true,
-		elf.EM_386:     true,
-		elf.EM_PPC64:   true,
-		elf.EM_RISCV:   true,
+		elf.EM_X86_64:    true,
+		elf.EM_AARCH64:   true,
+		elf.EM_386:       true,
+		elf.EM_PPC64:     true,
+		elf.EM_RISCV:     true,
+		elf.EM_LOONGARCH: true,
 	}
 
 	supportedWindowsArch = map[_PEMachine]bool{
@@ -190,7 +193,14 @@ func FindFileLocation(p Process, filename string, lineno int) ([]uint64, error) 
 	}
 
 	if len(pcs) == 0 {
-		return nil, &ErrCouldNotFindLine{fileFound, filename, lineno}
+		stripped := false
+		for _, image := range bi.Images {
+			if image.Stripped() && image.symTable != nil && image.symTable.Files[filename] != nil {
+				stripped = true
+				break
+			}
+		}
+		return nil, &ErrCouldNotFindLine{fileFound, stripped, filename, lineno}
 	}
 
 	// 2. assign all occurrences of filename:lineno to their containing function
@@ -824,6 +834,8 @@ func NewBinaryInfo(goos, goarch string) *BinaryInfo {
 		r.Arch = PPC64LEArch(goos)
 	case "riscv64":
 		r.Arch = RISCV64Arch(goos)
+	case "loong64":
+		r.Arch = LOONG64Arch(goos)
 	}
 	return r
 }
@@ -917,14 +929,20 @@ func (bi *BinaryInfo) PCToLine(pc uint64) (string, int, *Function) {
 }
 
 type ErrCouldNotFindLine struct {
-	fileFound bool
-	filename  string
-	lineno    int
+	fileFound, stripped bool
+	filename            string
+	lineno              int
 }
 
 func (err *ErrCouldNotFindLine) Error() string {
 	if err.fileFound {
+		if err.stripped {
+			return fmt.Sprintf("could not find statement at %s:%d, binary is stripped", err.filename, err.lineno)
+		}
 		return fmt.Sprintf("could not find statement at %s:%d, please use a line with a statement", err.filename, err.lineno)
+	}
+	if err.stripped {
+		return fmt.Sprintf("could not find file %s, binary is stripped", err.filename)
 	}
 	return fmt.Sprintf("could not find file %s", err.filename)
 }
@@ -1822,7 +1840,7 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 
 		bi.gStructOffset = tlsg.Value + uint64(bi.Arch.PtrSize()*2) + ((tls.Vaddr - uint64(bi.Arch.PtrSize()*2)) & (tls.Align - 1))
 
-	case elf.EM_PPC64, elf.EM_RISCV:
+	case elf.EM_PPC64, elf.EM_RISCV, elf.EM_LOONGARCH:
 		_ = getSymbol(image, bi.logger, exe, "runtime.tls_g")
 
 	default:
@@ -2305,7 +2323,7 @@ func loadBinaryInfoGoRuntimeCommon(bi *BinaryInfo, image *Image, cu *compileUnit
 	for i := range inlFuncs {
 		bi.Functions = append(bi.Functions, *inlFuncs[i])
 	}
-	sort.Sort(functionsDebugInfoByEntry(bi.Functions))
+	slices.SortFunc(bi.Functions, func(a, b Function) int { return cmp.Compare(a.Entry, b.Entry) })
 	for f := range image.symTable.Files {
 		bi.Sources = append(bi.Sources, f)
 	}
@@ -2370,10 +2388,10 @@ func (bi *BinaryInfo) findTypeExpr(expr ast.Expr) (godwarf.Type, error) {
 		alen, litlen := anode.Len.(*ast.BasicLit)
 		if litlen && alen.Kind == token.INT {
 			n, _ := strconv.Atoi(alen.Value)
-			return bi.findArrayType(n, exprToString(anode.Elt))
+			return bi.findArrayType(n, astutil.ExprToString(anode.Elt))
 		}
 	}
-	return bi.findType(exprToString(expr))
+	return bi.findType(astutil.ExprToString(expr))
 }
 
 func (bi *BinaryInfo) findArrayType(n int, etyp string) (godwarf.Type, error) {
@@ -2534,9 +2552,9 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 		}
 	}
 
-	sort.Sort(compileUnitsByOffset(image.compileUnits))
-	sort.Sort(functionsDebugInfoByEntry(bi.Functions))
-	sort.Sort(packageVarsByAddr(bi.packageVars))
+	slices.SortFunc(image.compileUnits, func(a, b *compileUnit) int { return cmp.Compare(a.offset, b.offset) })
+	slices.SortFunc(bi.Functions, func(a, b Function) int { return cmp.Compare(a.Entry, b.Entry) })
+	slices.SortFunc(bi.packageVars, func(a, b packageVar) int { return cmp.Compare(a.addr, b.addr) })
 
 	bi.lookupFunc = nil
 	bi.lookupGenericFunc = nil
