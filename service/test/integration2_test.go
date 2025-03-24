@@ -69,7 +69,7 @@ func startServer(name string, buildFlags protest.BuildFlags, t *testing.T, redir
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture = protest.BuildFixture(name, buildFlags)
+	fixture = protest.BuildFixture(t, name, buildFlags)
 	for i := range redirects {
 		if redirects[i] != "" {
 			redirects[i] = filepath.Join(fixture.BuildDir, redirects[i])
@@ -2067,7 +2067,7 @@ func TestAcceptMulticlient(t *testing.T) {
 		disconnectChan := make(chan struct{})
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("testvariables2", 0).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "testvariables2", 0).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2105,7 +2105,7 @@ func TestForceStopWhileContinue(t *testing.T) {
 		defer listener.Close()
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("http_server", protest.AllNonOptimized).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "http_server", protest.AllNonOptimized).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2493,7 +2493,7 @@ func TestDetachLeaveRunning(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture := protest.BuildFixture("testnextnethttp", buildFlags)
+	fixture := protest.BuildFixture(t, "testnextnethttp", buildFlags)
 
 	cmd := exec.Command(fixture.Path)
 	cmd.Stdout = os.Stdout
@@ -2572,7 +2572,7 @@ func TestStopServerWithClosedListener(t *testing.T) {
 	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	assertNoError(err, t, "listener")
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	server := rpccommon.NewServer(&service.Config{
 		Listener:           listener,
 		AcceptMulti:        false,
@@ -2782,6 +2782,8 @@ func TestClientServer_SinglelineStringFormattedWithBigInts(t *testing.T) {
 			"9331634762088972288", "8180A06000000000",
 			"9259436018245828608", "8080200000000000",
 			"9259436018245828608", "8080200000000000",
+			"0", "0", "0", "0",
+			"0", "0", "0", "0",
 		}
 
 		for i := range xmm0var.Children {
@@ -3155,6 +3157,8 @@ func TestBreakpointVariablesWithoutG(t *testing.T) {
 }
 
 func TestGuessSubstitutePath(t *testing.T) {
+	protest.MustHaveModules(t)
+
 	t.Setenv("NOCERT", "1")
 	ver, _ := goversion.Parse(runtime.Version())
 	if ver.IsDevelBuild() && os.Getenv("CI") != "" && runtime.GOOS == "linux" {
@@ -3292,5 +3296,51 @@ func TestGuessSubstitutePath(t *testing.T) {
 		if !found {
 			t.Fatalf("could not find main module path %q", delvePath)
 		}
+	})
+}
+
+func TestFollowExecFindLocation(t *testing.T) {
+	// FindLocation should not return an error if at least one of the currently
+	// attached targets can find the specified location.
+	// See issue #3933
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
+		t.Skip("follow exec not implemented")
+	}
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	childFixture := protest.BuildFixture(t, "spawnchild", buildFlags)
+
+	withTestClient2Extended("spawn", t, 0, [3]string{}, []string{"spawn2", childFixture.Path}, func(c service.Client, fixture protest.Fixture) {
+		assertNoError(c.FollowExec(true, ""), t, "FollowExec")
+		_, err := c.CreateBreakpointWithExpr(&api.Breakpoint{File: childFixture.Source, Line: 9}, fmt.Sprintf("%s:%d", childFixture.Source, 9), nil, true)
+		assertNoError(err, t, "CreateBreakpoint(spawnchild.go:9)")
+
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+
+		tgts, err := c.ListTargets()
+		assertNoError(err, t, "ListTargets")
+
+		t.Logf("%v\n", tgts)
+		found := false
+		for _, tgt := range tgts {
+			if tgt.Pid == state.Pid {
+				if !strings.Contains(tgt.CmdLine, "spawnchild") {
+					t.Fatalf("did not switch to child process")
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("current target not found")
+		}
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", childFixture.Source, 6), true, nil)
+		assertNoError(err, t, "FindLocation(spawnchild.go:6)")
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", fixture.Source, 19), true, nil)
+		assertNoError(err, t, "FindLocation(spawn.go:19)")
 	})
 }

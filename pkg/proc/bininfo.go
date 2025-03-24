@@ -42,7 +42,7 @@ import (
 
 const (
 	dwarfGoLanguage    = 22   // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
-	dwarfAttrAddrBase  = 0x74 // debug/dwarf.AttrAddrBase in Go 1.14, defined here for compatibility with Go < 1.14
+	dwarfAttrAddrBase  = 0x73 // debug/dwarf.AttrAddrBase in Go 1.14, defined here for compatibility with Go < 1.14
 	dwarfTreeCacheSize = 512  // size of the dwarfTree cache of each image
 )
 
@@ -1386,6 +1386,19 @@ func (bi *BinaryInfo) Producer() string {
 	return ""
 }
 
+// DwarfVersion returns the maximum DWARF version in the executable.
+func (bi *BinaryInfo) DwarfVersion() uint8 {
+	r := uint8(0)
+	for _, so := range bi.Images {
+		for _, cu := range so.compileUnits {
+			if cu.Version > r {
+				r = cu.Version
+			}
+		}
+	}
+	return r
+}
+
 // Type returns the Dwarf type entry at `offset`.
 func (image *Image) Type(offset dwarf.Offset) (godwarf.Type, error) {
 	return godwarf.ReadType(image.dwarf, image.index, offset, image.typeCache)
@@ -1430,6 +1443,17 @@ func (bi *BinaryInfo) parseDebugFrameGeneral(image *Image, debugFrameBytes []byt
 		}
 		bi.frameEntries = bi.frameEntries.Append(fe)
 	}
+}
+
+func (bi *BinaryInfo) getModuleData(mem MemoryReadWriter) ([]ModuleData, error) {
+	if bi.moduleDataCache == nil {
+		var err error
+		bi.moduleDataCache, err = LoadModuleData(bi, mem)
+		if err != nil {
+			return nil, fmt.Errorf("error loading module data: %v", err)
+		}
+	}
+	return bi.moduleDataCache, nil
 }
 
 // ELF ///////////////////////////////////////////////////////////////
@@ -2215,6 +2239,7 @@ func loadBinaryInfoGoRuntimeElf(bi *BinaryInfo, image *Image, path string, elfFi
 	// recover all panics.
 	defer func() {
 		ierr := recover()
+		logflags.Bug.Inc()
 		if ierr != nil {
 			err = fmt.Errorf("error loading binary info from Go runtime: %v", ierr)
 		}
@@ -2257,6 +2282,7 @@ func loadBinaryInfoGoRuntimeMacho(bi *BinaryInfo, image *Image, path string, exe
 	// recover all panics.
 	defer func() {
 		ierr := recover()
+		logflags.Bug.Inc()
 		if ierr != nil {
 			err = fmt.Errorf("error loading binary info from Go runtime: %v", ierr)
 		}

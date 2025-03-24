@@ -228,6 +228,10 @@ func (scope scopeToEvalLookup) HasBuiltin(name string) bool {
 	return supportedBuiltins[name] != nil
 }
 
+func (scope scopeToEvalLookup) PtrSize() int {
+	return scope.BinInfo.Arch.ptrSize
+}
+
 // ChanGoroutines returns the list of goroutines waiting to receive from or
 // send to the channel.
 func (scope *EvalScope) ChanGoroutines(expr string, start, count int) ([]int64, error) {
@@ -1046,6 +1050,7 @@ func (stack *evalStack) executeOp() {
 	scope, ops, curthread := stack.scope, stack.ops, stack.curthread
 	defer func() {
 		err := recover()
+		logflags.Bug.Inc()
 		if err != nil {
 			stack.err = fmt.Errorf("internal debugger error: %v (recovered)\n%s", err, string(debug.Stack()))
 		}
@@ -1177,6 +1182,10 @@ func (stack *evalStack) executeOp() {
 		copy(stack.stack[len(stack.stack)-op.N-1:], stack.stack[len(stack.stack)-op.N:])
 		stack.stack[len(stack.stack)-1] = rolled
 
+	case *evalop.Dup:
+		x := stack.stack[len(stack.stack)-1]
+		stack.push(x)
+
 	case *evalop.BuiltinCall:
 		vars := make([]*Variable, len(op.Args))
 		for i := len(op.Args) - 1; i >= 0; i-- {
@@ -1252,6 +1261,26 @@ func (stack *evalStack) executeOp() {
 
 	case *evalop.PushDebugPinner:
 		stack.push(stack.debugPinner)
+
+	case *evalop.PushBreakpointHitCount:
+		stack.push(newVariable(evalop.BreakpointHitCountVarNameQualified, fakeAddressUnresolv, godwarf.FakeSliceType(godwarf.FakeBasicType("uint", 64)), scope.BinInfo, scope.Mem))
+
+	case *evalop.PushRuntimeType:
+		typeAddr, err := dieToRuntimeType(scope.BinInfo, scope.Mem, op.Type)
+		if err != nil {
+			stack.err = err
+			break
+		}
+		rttyp, err := scope.BinInfo.findType(scope.BinInfo.runtimeTypeTypename())
+		if err != nil {
+			stack.err = err
+			break
+		}
+		v := newVariable("", typeAddr, rttyp, scope.BinInfo, scope.Mem)
+		stack.push(v.pointerToVariable())
+
+	case *evalop.PushNewFakeVariable:
+		stack.pushNewFakeVariable(scope, op.Type)
 
 	default:
 		stack.err = fmt.Errorf("internal debugger error: unknown eval opcode: %#v", op)
@@ -1352,6 +1381,17 @@ func (stack *evalStack) pushIdent(scope *EvalScope, name string) (found bool) {
 	return true
 }
 
+func (stack *evalStack) pushNewFakeVariable(scope *EvalScope, typ godwarf.Type) {
+	cm, err := CreateCompositeMemory(scope.Mem, scope.BinInfo.Arch, *new(op.DwarfRegisters), []op.Piece{{Kind: op.ImmPiece, Bytes: make([]byte, typ.Size()), Size: int(typ.Size())}}, typ.Size())
+	if err != nil {
+		stack.err = err
+		return
+	}
+	v := newVariable("", cm.base, typ, scope.BinInfo, cm)
+	v.Flags = VariableFakeAddress
+	stack.push(v)
+}
+
 func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 	ops, err := evalop.CompileAST(scopeToEvalLookup{scope}, t, scope.evalopFlags())
 	if err != nil {
@@ -1428,13 +1468,18 @@ func (scope *EvalScope) evalTypeCast(op *evalop.TypeCast, stack *evalStack) {
 
 	// compatible underlying types
 	if typeCastCompatibleTypes(argv.RealType, typ) {
-		if ptyp, isptr := typ.(*godwarf.PtrType); argv.Kind == reflect.Ptr && argv.loaded && len(argv.Children) > 0 && isptr {
+		ptyp, isptr := typ.(*godwarf.PtrType)
+		_, isvoid := argv.DwarfType.(*godwarf.VoidType)
+		if (argv.Kind == reflect.Ptr || isvoid) && argv.loaded && len(argv.Children) > 0 && isptr {
 			cv := argv.Children[0]
 			argv.Children[0] = *newVariable(cv.Name, cv.Addr, ptyp.Type, cv.bi, cv.mem)
 			argv.Children[0].OnlyAddr = true
 		}
 		argv.RealType = typ
 		argv.DwarfType = op.DwarfType
+		if isptr {
+			argv.Kind = reflect.Ptr // could be converting from unsafe.Pointer
+		}
 		stack.push(argv)
 		return
 	}
@@ -2068,6 +2113,33 @@ func (scope *EvalScope) evalIndex(op *evalop.Index, stack *evalStack) {
 	xev := stack.pop()
 	if xev.Unreadable != nil {
 		stack.err = xev.Unreadable
+		return
+	}
+
+	if xev.Name == evalop.BreakpointHitCountVarNameQualified {
+		if idxev.Kind == reflect.String {
+			s := constant.StringVal(idxev.Value)
+			thc, err := totalHitCountByName(scope.target.Breakpoints().Logical, s)
+			if err == nil {
+				stack.push(newConstant(constant.MakeUint64(thc), scope.Mem))
+			}
+			stack.err = err
+			return
+		}
+		n, err := idxev.asInt()
+		if err != nil {
+			n2, err := idxev.asUint()
+			if err != nil {
+				stack.err = fmt.Errorf("can not index %s with %s", xev.Name, astutil.ExprToString(op.Node.Index))
+				return
+			}
+			n = int64(n2)
+		}
+		thc, err := totalHitCountByID(scope.target.Breakpoints().Logical, int(n))
+		if err == nil {
+			stack.push(newConstant(constant.MakeUint64(thc), scope.Mem))
+		}
+		stack.err = err
 		return
 	}
 
