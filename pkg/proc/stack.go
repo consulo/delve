@@ -111,6 +111,14 @@ func (frame *Stackframe) contains(off int64) bool {
 func ThreadStacktrace(tgt *Target, thread Thread, depth int) ([]Stackframe, error) {
 	g, _ := GetG(thread)
 	if g == nil {
+		if cachedStack := tgt.scache.get(0, thread.ThreadID()); cachedStack != nil {
+			frames, err := cachedStack.it.stacktrace(depth, cachedStack.frames)
+			if err != nil {
+				return nil, err
+			}
+			tgt.scache.put(0, thread.ThreadID(), cachedStack.it, frames)
+			return limitframes(frames, depth+1), nil
+		}
 		regs, err := thread.Registers()
 		if err != nil {
 			return nil, err
@@ -119,7 +127,13 @@ func ThreadStacktrace(tgt *Target, thread Thread, depth int) ([]Stackframe, erro
 		dwarfRegs := *(thread.BinInfo().Arch.RegistersToDwarfRegisters(so.StaticBase, regs))
 		dwarfRegs.ChangeFunc = thread.SetReg
 		it := newStackIterator(tgt, thread.BinInfo(), thread.ProcessMemory(), dwarfRegs, 0, nil, 0)
-		return it.stacktrace(depth)
+		frames, err := it.stacktrace(depth, nil)
+		if err != nil {
+			return nil, err
+		}
+		tgt.scache.put(0, thread.ThreadID(), it, frames)
+		return frames, nil
+
 	}
 	return GoroutineStacktrace(tgt, g, depth, 0)
 }
@@ -165,16 +179,33 @@ const (
 // GoroutineStacktrace returns the stack trace for a goroutine.
 // Note the locations in the array are return addresses not call addresses.
 func GoroutineStacktrace(tgt *Target, g *G, depth int, opts StacktraceOptions) ([]Stackframe, error) {
+	if opts == 0 {
+		var threadID int
+		if g.Thread != nil {
+			threadID = g.Thread.ThreadID()
+		}
+		if cachedStack := tgt.scache.get(g.ID, threadID); cachedStack != nil {
+			frames, err := cachedStack.it.stacktrace(depth, cachedStack.frames)
+			if err != nil {
+				return nil, err
+			}
+			tgt.scache.put(g.ID, threadID, cachedStack.it, frames)
+			return limitframes(frames, depth+1), nil
+		}
+	}
 	it, err := goroutineStackIterator(tgt, g, opts)
 	if err != nil {
 		return nil, err
 	}
-	frames, err := it.stacktrace(depth)
+	frames, err := it.stacktrace(depth, nil)
 	if err != nil {
 		return nil, err
 	}
 	if opts&StacktraceReadDefers != 0 {
 		g.readDefers(frames)
+	}
+	if opts == 0 {
+		tgt.scache.put(g.ID, 0, it, frames)
 	}
 	return frames, nil
 }
@@ -293,15 +324,23 @@ func (it *stackIterator) Next() bool {
 	return true
 }
 
-func (it *stackIterator) switchToGoroutineStack() {
+func (it *stackIterator) switchToGoroutineStack() error {
+	if it.g == nil {
+		return fmt.Errorf("nil goroutine when attempting to switch to goroutine stack")
+	}
 	it.systemstack = false
 	it.top = false
 	it.pc = it.g.PC
 	it.regs.Reg(it.regs.SPRegNum).Uint64Val = it.g.SP
 	it.regs.AddReg(it.regs.BPRegNum, op.DwarfRegisterFromUint64(it.g.BP))
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" || it.bi.Arch.Name == "loong64" {
-		it.regs.Reg(it.regs.LRRegNum).Uint64Val = it.g.LR
+	if it.bi.Arch.usesLR {
+		lrReg := it.regs.Reg(it.regs.LRRegNum)
+		if lrReg == nil {
+			return fmt.Errorf("LR register is nil during stack switch")
+		}
+		lrReg.Uint64Val = it.g.LR
 	}
+	return nil
 }
 
 // Frame returns the frame the iterator is pointing at.
@@ -377,11 +416,19 @@ func (it *stackIterator) newStackframe(ret, retaddr uint64) Stackframe {
 	return r
 }
 
-func (it *stackIterator) stacktrace(depth int) ([]Stackframe, error) {
+func (it *stackIterator) stacktrace(depth int, initialFrames []Stackframe) ([]Stackframe, error) {
 	if depth < 0 {
 		return nil, errors.New("negative maximum stack depth")
 	}
-	frames := make([]Stackframe, 0, depth+1)
+	var frames []Stackframe
+	if len(initialFrames) > 0 {
+		frames = initialFrames
+		if len(frames) >= depth+1 {
+			return frames, nil
+		}
+	} else {
+		frames = make([]Stackframe, 0, depth+1)
+	}
 	f := func(frame Stackframe) bool {
 		frames = append(frames, frame)
 		return len(frames) < depth+1
@@ -406,14 +453,16 @@ func (it *stackIterator) stacktrace(depth int) ([]Stackframe, error) {
 		}
 
 		frames = append(frames, Stackframe{Err: err})
-
 	}
 	return frames, nil
 }
 
 func (it *stackIterator) stacktraceFunc(callback func(Stackframe) bool) {
 	if it.opts&StacktraceG != 0 && it.g != nil {
-		it.switchToGoroutineStack()
+		if err := it.switchToGoroutineStack(); err != nil {
+			it.err = err
+			return
+		}
 		it.top = true
 	}
 	for it.Next() {
@@ -497,15 +546,19 @@ func (it *stackIterator) appendInlineCalls(callback func(Stackframe) bool, frame
 // it.regs.CFA; the caller has to eventually switch it.regs when the iterator
 // advances to the next frame.
 func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uint64, retaddr uint64) {
+	logger := logflags.StackLogger()
+
 	fde, err := it.bi.frameEntries.FDEForPC(it.pc)
 	var framectx *frame.FrameContext
 	if _, nofde := err.(*frame.ErrNoFDEForPC); nofde {
 		framectx = it.bi.Arch.fixFrameUnwindContext(nil, it.pc, it.bi)
 	} else {
-		framectx = it.bi.Arch.fixFrameUnwindContext(fde.EstablishFrame(it.pc), it.pc, it.bi)
+		fctxt, err := fde.EstablishFrame(it.pc)
+		if err != nil {
+			logger.Errorf("Error executing Frame Debug Entry for PC %x: %v", it.pc, err)
+		}
+		framectx = it.bi.Arch.fixFrameUnwindContext(fctxt, it.pc, it.bi)
 	}
-
-	logger := logflags.StackLogger()
 
 	logger.Debugf("advanceRegs at %#x", it.pc)
 
@@ -580,7 +633,7 @@ func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uin
 		}
 	}
 
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" || it.bi.Arch.Name == "loong64" {
+	if it.bi.Arch.usesLR {
 		if ret == 0 && it.regs.Reg(it.regs.LRRegNum) != nil {
 			ret = it.regs.Reg(it.regs.LRRegNum).Uint64Val
 		}
@@ -654,9 +707,9 @@ func (it *stackIterator) loadG0SchedSP() {
 	}
 	it.g0_sched_sp_loaded = true
 	if it.g != nil {
-		mvar, _ := it.g.variable.structMember("m")
+		mvar, _ := it.g.variable.structField("m")
 		if mvar != nil {
-			g0var, _ := mvar.structMember("g0")
+			g0var, _ := mvar.structField("g0")
 			if g0var != nil {
 				g0, _ := g0var.parseG()
 				if g0 != nil {
@@ -1087,4 +1140,37 @@ func rangeFuncStackTrace(tgt *Target, g *G) ([]Stackframe, error) {
 	}
 	g.readDefers(frames)
 	return frames, nil
+}
+
+type cachedStack struct {
+	it     *stackIterator
+	frames []Stackframe
+}
+
+type stackCacheKey struct {
+	goid     int64
+	threadID int
+}
+
+type stackCache struct {
+	m map[stackCacheKey]*cachedStack
+}
+
+func (cache *stackCache) init() {
+	cache.m = make(map[stackCacheKey]*cachedStack)
+}
+
+func (cache *stackCache) get(goid int64, threadID int) *cachedStack {
+	return cache.m[stackCacheKey{goid, threadID}]
+}
+
+func (cache *stackCache) put(goid int64, threadID int, it *stackIterator, frames []Stackframe) {
+	cache.m[stackCacheKey{goid, threadID}] = &cachedStack{it, frames}
+}
+
+func limitframes(frames []Stackframe, n int) []Stackframe {
+	if len(frames) < n {
+		return frames
+	}
+	return frames[:n]
 }

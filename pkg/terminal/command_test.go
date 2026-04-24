@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"bytes"
+	"cmp"
 	"flag"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -55,7 +57,9 @@ const logCommandOutput = false
 func (ft *FakeTerminal) Exec(cmdstr string) (outstr string, err error) {
 	var buf bytes.Buffer
 	ft.Term.stdout.pw.w = &buf
-	ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
+	if ft.Term.starlarkEnv != nil {
+		ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
+	}
 	err = ft.cmds.Call(cmdstr, ft.Term)
 	outstr = buf.String()
 	if logCommandOutput {
@@ -245,6 +249,54 @@ func TestIssue411(t *testing.T) {
 	})
 }
 
+func TestCustomCommandNestedBreakpoint(t *testing.T) {
+	withTestTerminal("nestedbp", t, func(term *FakeTerminal) {
+		term.MustExec("source " + findStarFile("test_custom_cmd_nested"))
+
+		term.MustExec("break nestedbp.go:13") // BP 1
+		term.MustExec("break nestedbp.go:18") // BP 2
+		term.MustExec("break nestedbp.go:19") // BP 3
+
+		// Add custom commands to BP1:
+		// 1. cmd before continue (should execute)
+		// 2. continue cmd (should execute and hit BP2)
+		// 3. cmd after continue (should NOT execute)
+		term.MustExec("on 1 test_bp1_before_continue")
+		term.MustExec("on 1 test_bp1_continue_cmd")
+		term.MustExec("on 1 test_bp1_after_continue")
+
+		// Add custom commands to BP2 which should execute due to BP 1 custom command continue:
+		term.MustExec(fmt.Sprintf("on %d test_bp2_cmd", 2))
+		term.MustExec("on 2 test_bp1_continue_cmd")
+		term.MustExec("on 2 test_bp1_after_continue")
+
+		// Add command on BP3 which should execute due to BP 2 custom command continue:
+		term.MustExec("on 3 test_bp3_cmd")
+
+		out := term.MustExec("continue")
+
+		if !strings.Contains(out, "BP1_BEFORE_CONTINUE") {
+			t.Errorf("expected BP1_BEFORE_CONTINUE to be printed, got: %q", out)
+		}
+
+		if !strings.Contains(out, "BP1_CONTINUE_CMD") {
+			t.Errorf("expected BP1_CONTINUE_CMD to be printed, got: %q", out)
+		}
+
+		// Verify BP1 command after continue did NOT execute
+		if strings.Contains(out, "BP1_AFTER_CONTINUE") {
+			t.Errorf("BP1_AFTER_CONTINUE was printed, which means the command ran after continue, got: %q", out)
+		}
+
+		if !strings.Contains(out, "BP2_CMD_EXECUTED") {
+			t.Errorf("BP2's custom commands not executed")
+		}
+		if !strings.Contains(out, "BP3_CMD_EXECUTED") {
+			t.Errorf("BP3's custom commands not executed")
+		}
+	})
+}
+
 func TestTrace(t *testing.T) {
 	test.AllowRecording(t)
 	withTestTerminal("issue573", t, func(term *FakeTerminal) {
@@ -346,7 +398,7 @@ func TestScopePrefix(t *testing.T) {
 				curgid = gid
 			}
 
-			if idx := strings.Index(line, " main.agoroutine "); idx < 0 {
+			if found := strings.Contains(line, " main.agoroutine "); !found {
 				nonagoroutines = append(nonagoroutines, gid)
 				continue
 			}
@@ -361,8 +413,8 @@ func TestScopePrefix(t *testing.T) {
 		if len(agoroutines) < 10 {
 			extraAgoroutines := 0
 			for _, gid := range nonagoroutines {
-				stackOut := strings.Split(term.MustExec(fmt.Sprintf("goroutine %d stack", gid)), "\n")
-				for _, line := range stackOut {
+				stackOut := strings.SplitSeq(term.MustExec(fmt.Sprintf("goroutine %d stack", gid)), "\n")
+				for line := range stackOut {
 					if strings.HasSuffix(line, " main.agoroutine") {
 						extraAgoroutines++
 						break
@@ -384,16 +436,16 @@ func TestScopePrefix(t *testing.T) {
 			fid := -1
 			for _, line := range stackOut {
 				line = strings.TrimLeft(line, " ")
-				space := strings.Index(line, " ")
-				if space < 0 {
+				before, _, ok := strings.Cut(line, " ")
+				if !ok {
 					continue
 				}
-				curfid, err := strconv.Atoi(line[:space])
+				curfid, err := strconv.Atoi(before)
 				if err != nil {
 					continue
 				}
 
-				if idx := strings.Index(line, " main.agoroutine"); idx >= 0 {
+				if found := strings.Contains(line, " main.agoroutine"); found {
 					fid = curfid
 					break
 				}
@@ -858,6 +910,13 @@ func TestConfig(t *testing.T) {
 	assertDebugInfoDirs(t, term.conf.DebugInfoDirectories, "a", "c")
 	assertNoErrorConfigureCmd(t, &term, "debug-info-directories -clear")
 	assertDebugInfoDirs(t, term.conf.DebugInfoDirectories)
+
+	ft := &FakeTerminal{&term, t}
+	_, err = ft.Exec("help config blah")
+	if err == nil {
+		t.Errorf("expected error executing help config for an unknown parameter")
+	}
+	ft.MustExec("help config substitute-path")
 }
 
 func TestIssue1090(t *testing.T) {
@@ -1508,7 +1567,7 @@ func TestListPackages(t *testing.T) {
 		out := term.MustExec("packages")
 		t.Logf("> packages\n%s", out)
 		seen := map[string]bool{}
-		for _, p := range strings.Split(strings.TrimSpace(out), "\n") {
+		for p := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 			seen[p] = true
 		}
 		if !seen["main"] || !seen["runtime"] {
@@ -1518,7 +1577,7 @@ func TestListPackages(t *testing.T) {
 		out = term.MustExec("packages runtime")
 		t.Logf("> packages runtime\n%s", out)
 
-		for _, p := range strings.Split(strings.TrimSpace(out), "\n") {
+		for p := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 			if !strings.Contains(p, "runtime") {
 				t.Errorf("output includes unexpected %q", p)
 			}
@@ -1577,6 +1636,172 @@ func TestDisplay(t *testing.T) {
 	})
 }
 
+// compareBreakpoints compares two lists of breakpoints, considering only
+// the fields that are preserved during save/restore. It ignores runtime state like
+// IDs, names, addresses, and hit counts.
+func compareBreakpoints(t *testing.T, before, after []*api.Breakpoint) {
+	t.Helper()
+
+	// Sort both lists by File:Line for stable comparison
+	// We mainly need this function for Tracepoints.
+	sortBps := func(bps []*api.Breakpoint) []*api.Breakpoint {
+		sorted := make([]*api.Breakpoint, len(bps))
+		copy(sorted, bps)
+		slices.SortFunc(sorted, func(a, b *api.Breakpoint) int {
+			if a.File != b.File {
+				return strings.Compare(a.File, b.File)
+			}
+			return cmp.Compare(a.Line, b.Line)
+		})
+		return sorted
+	}
+
+	beforeSorted := sortBps(before)
+	afterSorted := sortBps(after)
+
+	if len(beforeSorted) != len(afterSorted) {
+		t.Errorf("Breakpoint count mismatch: before=%d, after=%d", len(beforeSorted), len(afterSorted))
+		return
+	}
+
+	for i := range beforeSorted {
+		b := beforeSorted[i]
+		a := afterSorted[i]
+
+		if b.File != a.File {
+			t.Errorf("Breakpoint %d: File mismatch: before=%q, after=%q", i, b.File, a.File)
+		}
+		if b.Line != a.Line {
+			t.Errorf("Breakpoint %d: Line mismatch: before=%d, after=%d", i, b.Line, a.Line)
+		}
+
+		if b.Tracepoint != a.Tracepoint {
+			t.Errorf("Breakpoint %d: Tracepoint mismatch: before=%v, after=%v", i, b.Tracepoint, a.Tracepoint)
+		}
+		if b.Cond != a.Cond {
+			t.Errorf("Breakpoint %d: Cond mismatch: before=%q, after=%q", i, b.Cond, a.Cond)
+		}
+		if b.HitCond != a.HitCond {
+			t.Errorf("Breakpoint %d: HitCond mismatch: before=%q, after=%q", i, b.HitCond, a.HitCond)
+		}
+		if b.HitCondPerG != a.HitCondPerG {
+			t.Errorf("Breakpoint %d: HitCondPerG mismatch: before=%v, after=%v", i, b.HitCondPerG, a.HitCondPerG)
+		}
+		if b.Disabled != a.Disabled {
+			t.Errorf("Breakpoint %d: Disabled mismatch: before=%v, after=%v", i, b.Disabled, a.Disabled)
+		}
+	}
+}
+
+func TestBreakpointSave(t *testing.T) {
+	test.AllowRecording(t)
+	tests := []struct {
+		name           string
+		breakpointCmds []string
+	}{
+		{
+			name: "basic breakpoint save",
+			breakpointCmds: []string{
+				"break main.main",
+				"break _fixtures/break.go:4",
+			},
+		},
+		{
+			name: "breakpoint with condition",
+			breakpointCmds: []string{
+				"break main.main:4 if i == 3",
+			},
+		},
+		{
+			name: "disabled breakpoint",
+			breakpointCmds: []string{
+				"break main main.main",
+				"toggle main",
+			},
+		},
+		{
+			name: "tracepoint",
+			breakpointCmds: []string{
+				"trace main.main",
+			},
+		},
+		{
+			name:           "empty breakpoint list",
+			breakpointCmds: []string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			withTestTerminal("break", t, func(term *FakeTerminal) {
+				for _, cmd := range tc.breakpointCmds {
+					term.MustExec(cmd)
+				}
+
+				// Capture breakpoints before save
+				bpsBefore, err := term.client.ListBreakpoints(false)
+				assertNoError(t, err, "ListBreakpoints before save")
+
+				f, err := os.CreateTemp("", "test*.txt")
+				if err != nil {
+					t.Fatalf("Failed to create temp file: %v", err)
+				}
+				f.Close()
+				defer os.Remove(f.Name())
+
+				term.MustExec("breakpoints -save " + f.Name())
+				term.MustExec("clearall")
+				term.MustExec("source " + f.Name())
+
+				// Capture breakpoints after restore
+				bpsAfter, err := term.client.ListBreakpoints(false)
+				assertNoError(t, err, "ListBreakpoints after restore")
+
+				// Compare breakpoints
+				compareBreakpoints(t, bpsBefore, bpsAfter)
+			})
+		})
+	}
+
+	// Test case for detecting modified/corrupted save files. It is the same
+	// idea as in the other tests but we add an additional breakpoint after
+	// sourcing the file
+	t.Run("detect additional breakpoint", func(t *testing.T) {
+		withTestTerminal("break", t, func(term *FakeTerminal) {
+			term.MustExec("break main.main")
+			term.MustExec("break _fixtures/break.go:4")
+
+			bpsBefore, err := term.client.ListBreakpoints(false)
+			assertNoError(t, err, "ListBreakpoints before save")
+
+			f, err := os.CreateTemp("", "test*.txt")
+			if err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			f.Close()
+			defer os.Remove(f.Name())
+
+			term.MustExec("breakpoints -save " + f.Name())
+			term.MustExec("clearall")
+			term.MustExec("source " + f.Name())
+
+			// Inject an extra breakpoint after sourcing
+			term.MustExec("break _fixtures/break.go:6")
+
+			bpsAfter, err := term.client.ListBreakpoints(false)
+			assertNoError(t, err, "ListBreakpoints after restore")
+
+			// Verify that we detected the injected breakpoint
+			// We expect 3 breakpoints (2 original + 1 injected) instead of 2
+			if len(bpsBefore) == len(bpsAfter) {
+				t.Errorf("Failed to detect injected breakpoint: before=%d, after=%d", len(bpsBefore), len(bpsAfter))
+			}
+			if len(bpsAfter) != len(bpsBefore)+1 {
+				t.Errorf("Unexpected breakpoint count after injection: expected=%d, got=%d", len(bpsBefore)+1, len(bpsAfter))
+			}
+		})
+	})
+}
+
 func TestBreakPointFailWithCond(t *testing.T) {
 	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
 		t.Skip("follow exec not implemented")
@@ -1593,11 +1818,176 @@ func TestBreakPointFailWithCond(t *testing.T) {
 		assertNoError(t, term.client.FollowExec(true, ""), "FollowExec")
 		_, err := term.Exec("break spawnchild.go:11 if i == 1")
 		if err != nil {
-			t.Errorf("expect to set a suspened breakpoint")
+			t.Fatalf("expect to set a suspended breakpoint: %v", err)
 		}
 		bp, _ := term.client.GetBreakpoint(1)
 		if bp.Cond != "i == 1" {
 			t.Errorf("expected condition to be 'i == 1', got %s", bp.Cond)
+		}
+	})
+}
+
+func TestTraceRegexpReturn(t *testing.T) {
+	withTestTerminal("traceret", t, func(term *FakeTerminal) {
+		out, err := term.Exec(`trace /main\.fncall./`)
+		if err != nil {
+			t.Errorf("error executing trace command: %v", err)
+		}
+		out, _ = term.Exec("continue")
+		t.Logf("continue: %q", out)
+		if out != "> goroutine(1): main.fncall1()\n>> goroutine(1): main.fncall1 => (1)\n> goroutine(1): main.fncall2()\n>> goroutine(1): main.fncall2 => (2)\n" {
+			t.Errorf("wrong output for continue")
+		}
+	})
+}
+
+func TestStarlarkOnPrefix(t *testing.T) {
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		term.MustExec("source " + findStarFile("test_allow_on"))
+
+		var customCmd *command
+		for i := range term.cmds.cmds {
+			cmd := &term.cmds.cmds[i]
+			if cmd.match("test_on_allowed") {
+				customCmd = cmd
+				break
+			}
+		}
+
+		if customCmd == nil {
+			t.Fatal("test_on_allowed command not found")
+		}
+
+		// All custom starlark commands should have onPrefix set
+		if customCmd.allowedPrefixes&onPrefix == 0 {
+			t.Errorf("custom starlark command should have onPrefix set, got allowedPrefixes=%v", customCmd.allowedPrefixes)
+		}
+
+		term.MustExec("break main.main")
+
+		bps1, _ := term.client.ListBreakpoints(false)
+		var targetBpID int
+		for _, bp := range bps1 {
+			if bp.FunctionName == "main.main" {
+				targetBpID = bp.ID
+				break
+			}
+		}
+		if targetBpID == 0 {
+			t.Fatal("Could not find breakpoint on main.main")
+		}
+
+		term.MustExec(fmt.Sprintf("on %d test_on_allowed", targetBpID))
+
+		bpListOutput := term.MustExec("breakpoints")
+		if !strings.Contains(bpListOutput, "test_on_allowed") {
+			t.Errorf("expected 'test_on_allowed' to appear in breakpoints output, got: %q", bpListOutput)
+		}
+
+		breakpoints, err := term.client.ListBreakpoints(false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(breakpoints) == 0 {
+			t.Fatal("no breakpoints found")
+		}
+
+		var bp *api.Breakpoint
+		for _, b := range breakpoints {
+			if b.ID == targetBpID {
+				bp = b
+				break
+			}
+		}
+		if bp == nil {
+			t.Fatalf("Could not find breakpoint with ID %d", targetBpID)
+		}
+
+		if len(bp.CustomCommands) == 0 {
+			t.Errorf("expected custom command to be registered on breakpoint, but CustomCommands is empty")
+		} else {
+			found := slices.Contains(bp.CustomCommands, "test_on_allowed")
+			if !found {
+				t.Errorf("expected 'test_on_allowed' to be in CustomCommands, got %v", bp.CustomCommands)
+			}
+		}
+
+		term.MustExec(fmt.Sprintf("on %d test_on_allowed hello world", targetBpID))
+
+		bpListOutput2 := term.MustExec("breakpoints")
+		if !strings.Contains(bpListOutput2, "test_on_allowed hello world") {
+			t.Errorf("expected 'test_on_allowed hello world' to appear in breakpoints output, got: %q", bpListOutput2)
+		}
+
+		out := term.MustExec("continue")
+		if !strings.Contains(out, "test_on_allowed called with:") {
+			t.Errorf("expected custom command to be executed when breakpoint is hit, but output was: %q", out)
+		}
+		if !strings.Contains(out, "test_on_allowed called with: hello world") {
+			t.Errorf("expected custom command with args to be executed, but output was: %q", out)
+		}
+	})
+}
+
+func TestCustomCommandStopsOnContinue(t *testing.T) {
+	// This test verifies that when a custom command triggers a runCmd (like continue),
+	// the execution of remaining custom commands is stopped because the process state
+	// has been invalidated.
+	withTestTerminal("break", t, func(term *FakeTerminal) {
+		term.MustExec("source " + findStarFile("test_custom_cmd_continue"))
+
+		term.MustExec("break break.go:7")
+
+		bps, _ := term.client.ListBreakpoints(false)
+		var targetBpID int
+		for _, bp := range bps {
+			if strings.Contains(bp.File, "break.go") && bp.Line == 7 {
+				targetBpID = bp.ID
+				break
+			}
+		}
+		if targetBpID == 0 {
+			t.Fatal("Could not find breakpoint on break.go:7")
+		}
+
+		// Add three custom commands to the breakpoint:
+		// 1. cmd before continue (should execute)
+		// 2. continue (should execute and invalidate state)
+		// 3. cmd after continue (should NOT execute because state is invalid)
+		term.MustExec(fmt.Sprintf("on %d test_cmd_before_continue", targetBpID))
+		term.MustExec(fmt.Sprintf("on %d test_continue_cmd", targetBpID))
+		term.MustExec(fmt.Sprintf("on %d test_cmd_after_continue", targetBpID))
+
+		out := term.MustExec("continue")
+
+		if !strings.Contains(out, "BEFORE_CONTINUE") {
+			t.Errorf("expected BEFORE_CONTINUE to be printed, got: %q", out)
+		}
+
+		if !strings.Contains(out, "CONTINUE_CMD") {
+			t.Errorf("expected CONTINUE_CMD to be printed, got: %q", out)
+		}
+
+		if strings.Contains(out, "AFTER_CONTINUE") {
+			t.Errorf("AFTER_CONTINUE was printed, which means the command ran after continue, got: %q", out)
+		}
+	})
+}
+
+func TestCommandPromptExpansion(t *testing.T) {
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		term.MustExec("continue")
+		for _, e := range []struct{ in, tgt string }{
+			{"$u", "<malformed escape>"},
+			{"malformed at end $", "malformed at end <malformed escape>"},
+			{"$g", "1"},
+			{"$g:$f>", "1:0>"},
+			{"$$g", "$g"},
+		} {
+			out := term.expandPrompt(e.in)
+			if out != e.tgt {
+				t.Errorf("input %q expected %q got %q\n", e.in, e.tgt, out)
+			}
 		}
 	})
 }

@@ -22,6 +22,7 @@ type RPCClient struct {
 	client *rpc.Client
 
 	retValLoadCfg *api.LoadConfig
+	eventsFn      func(*api.Event)
 }
 
 // Ensure the implementation satisfies the interface.
@@ -45,6 +46,12 @@ func newFromRPCClient(client *rpc.Client) *RPCClient {
 // NewClientFromConn creates a new RPCClient from the given connection.
 func NewClientFromConn(conn net.Conn) *RPCClient {
 	return newFromRPCClient(jsonrpc.NewClient(conn))
+}
+
+func (c *RPCClient) GetVersion() *api.GetVersionOut {
+	out := new(api.GetVersionOut)
+	c.call("GetVersion", api.GetVersionIn{}, out)
+	return out
 }
 
 func (c *RPCClient) ProcessPid() int {
@@ -112,7 +119,7 @@ func (c *RPCClient) continueDir(cmd string) <-chan *api.DebuggerState {
 	go func() {
 		for {
 			out := new(CommandOut)
-			err := c.call("Command", &api.DebuggerCommand{Name: cmd, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+			err := c.callWhileDrainingEvents("Command", &api.DebuggerCommand{Name: cmd, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 			state := out.State
 			if err != nil {
 				state.Err = err
@@ -146,45 +153,70 @@ func (c *RPCClient) continueDir(cmd string) <-chan *api.DebuggerState {
 	return ch
 }
 
+func (c *RPCClient) drainEvents() <-chan struct{} {
+	done := make(chan struct{})
+	if c.eventsFn == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		for {
+			out := new(GetEventsOut)
+			err := c.call("GetEvents", &GetEventsIn{}, &out)
+			if err != nil {
+				break
+			}
+			for _, event := range out.Events {
+				c.eventsFn(&event)
+				if event.Kind == api.EventStopped {
+					return
+				}
+			}
+		}
+	}()
+	return done
+}
+
 func (c *RPCClient) Next() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.Next, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.Next, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) ReverseNext() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseNext, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.ReverseNext, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) Step() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.Step, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.Step, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) ReverseStep() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseStep, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.ReverseStep, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) StepOut() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.StepOut, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.StepOut, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) ReverseStepOut() (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseStepOut, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.ReverseStepOut, ReturnInfoLoadConfig: c.retValLoadCfg, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
 func (c *RPCClient) Call(goroutineID int64, expr string, unsafe bool) (*api.DebuggerState, error) {
 	var out CommandOut
-	err := c.call("Command", api.DebuggerCommand{Name: api.Call, ReturnInfoLoadConfig: c.retValLoadCfg, Expr: expr, UnsafeCall: unsafe, GoroutineID: goroutineID}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: api.Call, ReturnInfoLoadConfig: c.retValLoadCfg, Expr: expr, UnsafeCall: unsafe, GoroutineID: goroutineID, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
@@ -194,7 +226,7 @@ func (c *RPCClient) StepInstruction(skipCalls bool) (*api.DebuggerState, error) 
 	if skipCalls {
 		name = api.NextInstruction
 	}
-	err := c.call("Command", api.DebuggerCommand{Name: name}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: name, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
@@ -204,7 +236,7 @@ func (c *RPCClient) ReverseStepInstruction(skipCalls bool) (*api.DebuggerState, 
 	if skipCalls {
 		name = api.ReverseNextInstruction
 	}
-	err := c.call("Command", api.DebuggerCommand{Name: name}, &out)
+	err := c.callWhileDrainingEvents("Command", api.DebuggerCommand{Name: name, WithEvents: c.eventsFn != nil}, &out)
 	return &out.State, err
 }
 
@@ -415,9 +447,9 @@ func (c *RPCClient) ListGoroutinesWithFilter(start, count int, filters []api.Lis
 	return out.Goroutines, out.Groups, out.Nextg, out.TooManyGroups, err
 }
 
-func (c *RPCClient) Stacktrace(goroutineId int64, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error) {
+func (c *RPCClient) Stacktrace(goroutineId int64, depth, skip int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error) {
 	var out StacktraceOut
-	err := c.call("Stacktrace", StacktraceIn{goroutineId, depth, false, false, opts, cfg}, &out)
+	err := c.call("Stacktrace", StacktraceIn{goroutineId, depth, false, false, opts, cfg, skip}, &out)
 	return out.Locations, err
 }
 
@@ -492,6 +524,10 @@ func (c *RPCClient) SetReturnValuesLoadConfig(cfg *api.LoadConfig) {
 	c.retValLoadCfg = cfg
 }
 
+func (c *RPCClient) SetEventsFn(eventsFn func(*api.Event)) {
+	c.eventsFn = eventsFn
+}
+
 func (c *RPCClient) FunctionReturnLocations(fnName string) ([]uint64, error) {
 	var out FunctionReturnLocationsOut
 	err := c.call("FunctionReturnLocations", FunctionReturnLocationsIn{fnName}, &out)
@@ -512,10 +548,10 @@ func (c *RPCClient) Disconnect(cont bool) error {
 	return c.client.Close()
 }
 
-func (c *RPCClient) ListDynamicLibraries() ([]api.Image, error) {
+func (c *RPCClient) ListDynamicLibraries() ([]api.Image, bool, error) {
 	var out ListDynamicLibrariesOut
 	c.call("ListDynamicLibraries", ListDynamicLibrariesIn{}, &out)
-	return out.List, nil
+	return out.List, out.ExecutableTrimpath, nil
 }
 
 func (c *RPCClient) ExamineMemory(address uint64, count int) ([]byte, bool, error) {
@@ -663,10 +699,36 @@ func (c *RPCClient) GuessSubstitutePath() ([][2]string, error) {
 	return out.List, err
 }
 
-func (c *RPCClient) call(method string, args, reply interface{}) error {
+func (c *RPCClient) CancelDownloads() error {
+	out := &CancelDownloadsOut{}
+	return c.call("CancelDownloads", CancelDownloadsIn{}, out)
+}
+
+func (c *RPCClient) DownloadLibraryDebugInfo(n int) error {
+	out := DownloadLibraryDebugInfoOut{}
+	return c.call("DownloadLibraryDebugInfo", DownloadLibraryDebugInfoIn{n}, out)
+}
+
+func (c *RPCClient) TypeInfo(name string) (*api.TypeInfo, error) {
+	var out TypeInfoOut
+	err := c.call("TypeInfo", TypeInfoIn{name}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out.TypeInfo, err
+}
+
+func (c *RPCClient) call(method string, args, reply any) error {
 	return c.client.Call("RPCServer."+method, args, reply)
 }
 
-func (c *RPCClient) CallAPI(method string, args, reply interface{}) error {
+func (c *RPCClient) callWhileDrainingEvents(method string, args, reply any) error {
+	done := c.drainEvents()
+	err := c.call(method, args, reply)
+	<-done
+	return err
+}
+
+func (c *RPCClient) CallAPI(method string, args, reply any) error {
 	return c.call(method, args, reply)
 }

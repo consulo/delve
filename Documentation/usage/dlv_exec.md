@@ -21,6 +21,7 @@ dlv exec <path/to/binary> [flags]
 ```
       --continue     Continue the debugged process on start.
   -h, --help         help for exec
+      --rr-cleanup   Delete directory containing debug recording on detach. (default true)
       --tty string   TTY to use for the target program
 ```
 

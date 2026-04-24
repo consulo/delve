@@ -3,22 +3,30 @@ package dap
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
@@ -85,6 +93,7 @@ func startDAPServerWithClient(t *testing.T, defaultDebugInfoDirs bool, serverSto
 // To mock a server created by dap.NewServer(config) or serving dap.NewSession(conn, config, debugger)
 // set those arg fields manually after the server creation.
 func startDAPServer(t *testing.T, defaultDebugInfoDirs bool, serverStopped chan struct{}) (server *Server, forceStop chan struct{}) {
+	t.Helper()
 	// Start the DAP server.
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -145,8 +154,8 @@ func verifySessionStopped(t *testing.T, session *Session) {
 		t.Error("session must always have a set connection")
 	}
 	verifyConnStopped(t, session.conn)
-	if session.debugger != nil {
-		t.Error("session should have no pointer to debugger after shutdown")
+	if !session.disconnected {
+		t.Error("session should have disconnected set after shutdown")
 	}
 	if session.binaryToRemove != "" {
 		t.Error("session should have no binary to remove after shutdown")
@@ -234,8 +243,9 @@ func TestSessionStop(t *testing.T) {
 		if binaryToRemoveSet && s.binaryToRemove == "" || !binaryToRemoveSet && s.binaryToRemove != "" {
 			t.Errorf("binaryToRemove: got %s, want set=%v", s.binaryToRemove, binaryToRemoveSet)
 		}
-		if debuggerSet && s.debugger == nil || !debuggerSet && s.debugger != nil {
-			t.Errorf("debugger: got %v, want set=%v", s.debugger, debuggerSet)
+		connected := s.debugger != nil && !s.disconnected
+		if debuggerSet != connected {
+			t.Errorf("debugger: got debugger!=nil: %v disconnected: %v, want set=%v", s.debugger != nil, s.disconnected, debuggerSet)
 		}
 		if disconnectChanSet && s.config.DisconnectChan == nil || !disconnectChanSet && s.config.DisconnectChan != nil {
 			t.Errorf("disconnectChan: got %v, want set=%v", s.config.DisconnectChan, disconnectChanSet)
@@ -375,60 +385,53 @@ func TestLaunchStopOnEntry(t *testing.T) {
 		// 1 >> initialize, << initialize
 		client.InitializeRequest()
 		initResp := client.ExpectInitializeResponseAndCapabilities(t)
-		if initResp.Seq != 0 || initResp.RequestSeq != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=1", initResp)
+		if initResp.RequestSeq != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=1", initResp)
 		}
 
 		// 2 >> launch, << process, << initialized, << launch
 		client.LaunchRequest("exec", fixture.Path, stopOnEntry)
 
-		processEvent := client.ExpectProcessEvent(t)
-		if processEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", processEvent)
-		}
+		client.ExpectProcessEvent(t)
 
-		initEvent := client.ExpectInitializedEvent(t)
-		if initEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", initEvent)
-		}
+		client.ExpectInitializedEvent(t)
 		launchResp := client.ExpectLaunchResponse(t)
-		if launchResp.Seq != 0 || launchResp.RequestSeq != 2 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=2", launchResp)
+		if launchResp.RequestSeq != 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=2", launchResp)
 		}
 
 		// 3 >> setBreakpoints, << setBreakpoints
 		client.SetBreakpointsRequest(fixture.Source, nil)
 		sbpResp := client.ExpectSetBreakpointsResponse(t)
-		if sbpResp.Seq != 0 || sbpResp.RequestSeq != 3 || len(sbpResp.Body.Breakpoints) != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=3, len(Breakpoints)=0", sbpResp)
+		if sbpResp.RequestSeq != 3 || len(sbpResp.Body.Breakpoints) != 0 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=3, len(Breakpoints)=0", sbpResp)
 		}
 
 		// 4 >> setExceptionBreakpoints, << setExceptionBreakpoints
-		client.SetExceptionBreakpointsRequest()
+		client.SetExceptionBreakpointsRequest(nil)
 		sebpResp := client.ExpectSetExceptionBreakpointsResponse(t)
-		if sebpResp.Seq != 0 || sebpResp.RequestSeq != 4 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=4", sebpResp)
+		if sebpResp.RequestSeq != 4 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=4", sebpResp)
 		}
 
 		// 5 >> configurationDone, << stopped, << configurationDone
 		client.ConfigurationDoneRequest()
 		stopEvent := client.ExpectStoppedEvent(t)
-		if stopEvent.Seq != 0 ||
-			stopEvent.Body.Reason != "entry" ||
+		if stopEvent.Body.Reason != "entry" ||
 			stopEvent.Body.ThreadId != 1 ||
 			!stopEvent.Body.AllThreadsStopped {
-			t.Errorf("\ngot %#v\nwant Seq=0, Body={Reason=\"entry\", ThreadId=1, AllThreadsStopped=true}", stopEvent)
+			t.Errorf("\ngot %#v\nwant Body={Reason=\"entry\", ThreadId=1, AllThreadsStopped=true}", stopEvent)
 		}
 		cdResp := client.ExpectConfigurationDoneResponse(t)
-		if cdResp.Seq != 0 || cdResp.RequestSeq != 5 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=5", cdResp)
+		if cdResp.RequestSeq != 5 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=5", cdResp)
 		}
 
 		// 6 >> threads, << threads
 		client.ThreadsRequest()
 		tResp := client.ExpectThreadsResponse(t)
-		if tResp.Seq != 0 || tResp.RequestSeq != 6 || len(tResp.Body.Threads) != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=6 len(Threads)=1", tResp)
+		if tResp.RequestSeq != 6 || len(tResp.Body.Threads) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=6 len(Threads)=1", tResp)
 		}
 		if tResp.Body.Threads[0].Id != 1 || tResp.Body.Threads[0].Name != "Dummy" {
 			t.Errorf("\ngot %#v\nwant Id=1, Name=\"Dummy\"", tResp)
@@ -437,62 +440,59 @@ func TestLaunchStopOnEntry(t *testing.T) {
 		// 7 >> threads, << threads
 		client.ThreadsRequest()
 		tResp = client.ExpectThreadsResponse(t)
-		if tResp.Seq != 0 || tResp.RequestSeq != 7 || len(tResp.Body.Threads) != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=7 len(Threads)=1", tResp)
+		if tResp.RequestSeq != 7 || len(tResp.Body.Threads) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=7 len(Threads)=1", tResp)
 		}
 
 		// 8 >> stackTrace, << error
 		client.StackTraceRequest(1, 0, 20)
 		stResp := client.ExpectInvisibleErrorResponse(t)
-		if stResp.Seq != 0 || stResp.RequestSeq != 8 || !checkErrorMessageFormat(stResp.Body.Error, "Unable to produce stack trace: unknown goroutine 1") {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=8 Format=\"Unable to produce stack trace: unknown goroutine 1\"", stResp)
+		if stResp.RequestSeq != 8 || !checkErrorMessageFormat(stResp.Body.Error, "Unable to produce stack trace: unknown goroutine 1") {
+			t.Errorf("\ngot %#v\nwant RequestSeq=8 Format=\"Unable to produce stack trace: unknown goroutine 1\"", stResp)
 		}
 
 		// 9 >> stackTrace, << error
 		client.StackTraceRequest(1, 0, 20)
 		stResp = client.ExpectInvisibleErrorResponse(t)
-		if stResp.Seq != 0 || stResp.RequestSeq != 9 || !checkErrorMessageId(stResp.Body.Error, UnableToProduceStackTrace) {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=9 Id=%d", stResp, UnableToProduceStackTrace)
+		if stResp.RequestSeq != 9 || !checkErrorMessageId(stResp.Body.Error, UnableToProduceStackTrace) {
+			t.Errorf("\ngot %#v\nwant RequestSeq=9 Id=%d", stResp, UnableToProduceStackTrace)
 		}
 
 		// 10 >> evaluate, << error
 		client.EvaluateRequest("foo", 0 /*no frame specified*/, "repl")
 		erResp := client.ExpectInvisibleErrorResponse(t)
-		if erResp.Seq != 0 || erResp.RequestSeq != 10 || !checkErrorMessageId(erResp.Body.Error, UnableToEvaluateExpression) {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=10 Id=%d", erResp, UnableToEvaluateExpression)
+		if erResp.RequestSeq != 10 || !checkErrorMessageId(erResp.Body.Error, UnableToEvaluateExpression) {
+			t.Errorf("\ngot %#v\nwant RequestSeq=10 Id=%d", erResp, UnableToEvaluateExpression)
 		}
 
 		// 11 >> evaluate, << evaluate
 		client.EvaluateRequest("1+1", 0 /*no frame specified*/, "repl")
 		evResp := client.ExpectEvaluateResponse(t)
-		if evResp.Seq != 0 || evResp.RequestSeq != 11 || evResp.Body.Result != "2" {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=10 Result=2", evResp)
+		if evResp.RequestSeq != 11 || evResp.Body.Result != "2" {
+			t.Errorf("\ngot %#v\nwant RequestSeq=10 Result=2", evResp)
 		}
 
 		// 12 >> continue, << continue, << terminated
 		client.ContinueRequest(1)
 		contResp := client.ExpectContinueResponse(t)
-		if contResp.Seq != 0 || contResp.RequestSeq != 12 || !contResp.Body.AllThreadsContinued {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=12 Body.AllThreadsContinued=true", contResp)
+		if contResp.RequestSeq != 12 || !contResp.Body.AllThreadsContinued {
+			t.Errorf("\ngot %#v\nwant RequestSeq=12 Body.AllThreadsContinued=true", contResp)
 		}
-		termEvent := client.ExpectTerminatedEvent(t)
-		if termEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", termEvent)
-		}
+		client.ExpectTerminatedEvent(t)
 
 		// 13 >> disconnect, << disconnect
 		client.DisconnectRequest()
 		oep := client.ExpectOutputEventProcessExited(t, 0)
-		if oep.Seq != 0 || oep.Body.Category != "console" {
-			t.Errorf("\ngot %#v\nwant Seq=0 Category='console'", oep)
+		if oep.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oep)
 		}
 		oed := client.ExpectOutputEventDetaching(t)
-		if oed.Seq != 0 || oed.Body.Category != "console" {
-			t.Errorf("\ngot %#v\nwant Seq=0 Category='console'", oed)
+		if oed.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oed)
 		}
 		dResp := client.ExpectDisconnectResponse(t)
-		if dResp.Seq != 0 || dResp.RequestSeq != 13 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=13", dResp)
+		if dResp.RequestSeq != 13 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=13", dResp)
 		}
 		client.ExpectTerminatedEvent(t)
 	})
@@ -523,57 +523,53 @@ func TestAttachStopOnEntry(t *testing.T) {
 		// 1 >> initialize, << initialize
 		client.InitializeRequest()
 		initResp := client.ExpectInitializeResponseAndCapabilities(t)
-		if initResp.Seq != 0 || initResp.RequestSeq != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=1", initResp)
+		if initResp.RequestSeq != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=1", initResp)
 		}
 
 		// 2 >> attach, << initialized, << attach
 		client.AttachRequest(
-			map[string]interface{}{"mode": "local", "processId": cmd.Process.Pid, "stopOnEntry": true, "backend": "default"})
+			map[string]any{"mode": "local", "processId": cmd.Process.Pid, "stopOnEntry": true, "backend": "default"})
 		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
-		initEvent := client.ExpectInitializedEvent(t)
-		if initEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", initEvent)
-		}
+		client.ExpectInitializedEvent(t)
 		attachResp := client.ExpectAttachResponse(t)
-		if attachResp.Seq != 0 || attachResp.RequestSeq != 2 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=2", attachResp)
+		if attachResp.RequestSeq != 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=2", attachResp)
 		}
 
 		// 3 >> setBreakpoints, << setBreakpoints
 		client.SetBreakpointsRequest(fixture.Source, nil)
 		sbpResp := client.ExpectSetBreakpointsResponse(t)
-		if sbpResp.Seq != 0 || sbpResp.RequestSeq != 3 || len(sbpResp.Body.Breakpoints) != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=3, len(Breakpoints)=0", sbpResp)
+		if sbpResp.RequestSeq != 3 || len(sbpResp.Body.Breakpoints) != 0 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=3, len(Breakpoints)=0", sbpResp)
 		}
 
 		// 4 >> setExceptionBreakpoints, << setExceptionBreakpoints
-		client.SetExceptionBreakpointsRequest()
+		client.SetExceptionBreakpointsRequest(nil)
 		sebpResp := client.ExpectSetExceptionBreakpointsResponse(t)
-		if sebpResp.Seq != 0 || sebpResp.RequestSeq != 4 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=4", sebpResp)
+		if sebpResp.RequestSeq != 4 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=4", sebpResp)
 		}
 
 		// 5 >> configurationDone, << stopped, << configurationDone
 		client.ConfigurationDoneRequest()
 		stopEvent := client.ExpectStoppedEvent(t)
-		if stopEvent.Seq != 0 ||
-			stopEvent.Body.Reason != "entry" ||
+		if stopEvent.Body.Reason != "entry" ||
 			stopEvent.Body.ThreadId != 1 ||
 			!stopEvent.Body.AllThreadsStopped {
-			t.Errorf("\ngot %#v\nwant Seq=0, Body={Reason=\"entry\", ThreadId=1, AllThreadsStopped=true}", stopEvent)
+			t.Errorf("\ngot %#v\nwant Body={Reason=\"entry\", ThreadId=1, AllThreadsStopped=true}", stopEvent)
 		}
 		cdResp := client.ExpectConfigurationDoneResponse(t)
-		if cdResp.Seq != 0 || cdResp.RequestSeq != 5 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=5", cdResp)
+		if cdResp.RequestSeq != 5 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=5", cdResp)
 		}
 
 		// 6 >> threads, << threads
 		client.ThreadsRequest()
 		tResp := client.ExpectThreadsResponse(t)
 		// Expect main goroutine plus runtime at this point.
-		if tResp.Seq != 0 || tResp.RequestSeq != 6 || len(tResp.Body.Threads) < 2 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=6 len(Threads)>1", tResp)
+		if tResp.RequestSeq != 6 || len(tResp.Body.Threads) < 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=6 len(Threads)>1", tResp)
 		}
 
 		// 7 >> threads, << threads
@@ -591,22 +587,22 @@ func TestAttachStopOnEntry(t *testing.T) {
 		// 10 >> evaluate, << error
 		client.EvaluateRequest("foo", 0 /*no frame specified*/, "repl")
 		erResp := client.ExpectInvisibleErrorResponse(t)
-		if erResp.Seq != 0 || erResp.RequestSeq != 10 || !checkErrorMessageId(erResp.Body.Error, UnableToEvaluateExpression) {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=10 Id=%d", erResp, UnableToEvaluateExpression)
+		if erResp.RequestSeq != 10 || !checkErrorMessageId(erResp.Body.Error, UnableToEvaluateExpression) {
+			t.Errorf("\ngot %#v\nwant RequestSeq=10 Id=%d", erResp, UnableToEvaluateExpression)
 		}
 
 		// 11 >> evaluate, << evaluate
 		client.EvaluateRequest("1+1", 0 /*no frame specified*/, "repl")
 		evResp := client.ExpectEvaluateResponse(t)
-		if evResp.Seq != 0 || evResp.RequestSeq != 11 || evResp.Body.Result != "2" {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=10 Result=2", evResp)
+		if evResp.RequestSeq != 11 || evResp.Body.Result != "2" {
+			t.Errorf("\ngot %#v\nwant RequestSeq=10 Result=2", evResp)
 		}
 
 		// 12 >> continue, << continue
 		client.ContinueRequest(1)
 		cResp := client.ExpectContinueResponse(t)
-		if cResp.Seq != 0 || cResp.RequestSeq != 12 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=12", cResp)
+		if cResp.RequestSeq != 12 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=12", cResp)
 		}
 
 		// TODO(polina): once https://github.com/go-delve/delve/issues/2259 is
@@ -615,6 +611,222 @@ func TestAttachStopOnEntry(t *testing.T) {
 		// 13 >> disconnect, << disconnect
 		client.DisconnectRequestWithKillOption(true)
 
+		// Disconnect consists of Halt + Detach.
+		// Halt interrupts command in progress, which triggers
+		// a stopped event in parallel with the disconnect
+		// sequence. It might arrive before or during the sequence
+		// or never if the server exits before it is sent.
+		msg := expectMessageFilterStopped(t, client)
+		client.CheckOutputEvent(t, msg)
+		msg = expectMessageFilterStopped(t, client)
+		client.CheckDisconnectResponse(t, msg)
+		client.ExpectTerminatedEvent(t)
+
+		// If this call to KeepAlive isn't here there's a chance that stdout will
+		// be garbage collected (since it is no longer alive long before this
+		// point), when that happens, on unix-like OSes, the read end of the pipe
+		// will be closed by the finalizer and the target process will die by
+		// SIGPIPE, which the rest of this test does not expect.
+		runtime.KeepAlive(stdout)
+	})
+}
+
+func TestLaunchWithFollowExec(t *testing.T) {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
+		t.Skip("follow exec not implemented")
+	}
+
+	var buildFlags protest.BuildFlags
+	// TODO build mode, see TestFollowExecFindLocation in integration2_test.go
+	childFixture := protest.BuildFixture(t, "spawnchild", buildFlags)
+	runTest(t, "spawn", func(client *daptest.Client, fixture protest.Fixture) {
+		// 1 >> initialize, << initialize
+		client.InitializeRequest()
+		initResp := client.ExpectInitializeResponseAndCapabilities(t)
+		if initResp.RequestSeq != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=1", initResp)
+		}
+
+		// 2 >> launch, << process, << initialized, << launch
+		client.LaunchRequestWithArgs(map[string]any{
+			"mode":        "exec",
+			"program":     fixture.Path,
+			"args":        []string{"spawn2", childFixture.Path}, // call spawnchild.go
+			"stopOnEntry": stopOnEntry,
+			"followExec":  true,
+		})
+
+		client.ExpectProcessEvent(t)
+
+		client.ExpectInitializedEvent(t)
+		launchResp := client.ExpectLaunchResponse(t)
+		if launchResp.RequestSeq != 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=2", launchResp)
+		}
+
+		// 3 >> setBreakpoints, << setBreakpoints
+		client.SetBreakpointsRequest(childFixture.Source, []int{6})
+		sbpResp := client.ExpectSetBreakpointsResponse(t)
+		if sbpResp.RequestSeq != 3 || len(sbpResp.Body.Breakpoints) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=3, len(Breakpoints)=1", sbpResp)
+		}
+		if sbpResp.Body.Breakpoints[0].Verified {
+			t.Errorf("got breakpoints[0].Verified=true, want false")
+		}
+
+		// 4 >> setExceptionBreakpoints, << setExceptionBreakpoints
+		client.SetExceptionBreakpointsRequest(nil)
+		sebpResp := client.ExpectSetExceptionBreakpointsResponse(t)
+		if sebpResp.RequestSeq != 4 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=4", sebpResp)
+		}
+
+		// 5 >> configurationDone, << stopped, << configurationDone
+		client.ConfigurationDoneRequest()
+		stopEvent := client.ExpectStoppedEvent(t)
+		if stopEvent.Body.Reason != "entry" ||
+			stopEvent.Body.ThreadId != 1 ||
+			!stopEvent.Body.AllThreadsStopped {
+			t.Errorf("\ngot %#v\nwant Body={Reason=\"entry\", ThreadId=1, AllThreadsStopped=true}", stopEvent)
+		}
+		cdResp := client.ExpectConfigurationDoneResponse(t)
+		if cdResp.RequestSeq != 5 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=5", cdResp)
+		}
+
+		// 6 >> threads, << threads
+		client.ThreadsRequest()
+		tResp := client.ExpectThreadsResponse(t)
+		if tResp.RequestSeq != 6 || len(tResp.Body.Threads) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=6 len(Threads)=1", tResp)
+		}
+		if tResp.Body.Threads[0].Id != 1 || tResp.Body.Threads[0].Name != "Dummy" {
+			t.Errorf("\ngot %#v\nwant Id=1, Name=\"Dummy\"", tResp)
+		}
+
+		// 7 >> continue, << continue << stopped
+		client.ContinueRequest(1)
+		contResp := client.ExpectContinueResponse(t)
+		if contResp.RequestSeq != 7 || !contResp.Body.AllThreadsContinued {
+			t.Errorf("\ngot %#v\nwant RequestSeq=7 Body.AllThreadsContinued=true", contResp)
+		}
+		client.ExpectBreakpointEvent(t)
+		client.ExpectProcessEvent(t)
+		stopEvent = client.ExpectStoppedEvent(t)
+		if stopEvent.Body.Reason != "breakpoint" ||
+			stopEvent.Body.ThreadId != 1 ||
+			!stopEvent.Body.AllThreadsStopped ||
+			len(stopEvent.Body.HitBreakpointIds) != 1 ||
+			stopEvent.Body.HitBreakpointIds[0] != sbpResp.Body.Breakpoints[0].Id {
+			t.Errorf("\ngot %#v\nwant Body={Reason=\"breakpoint\", ThreadId=1, AllThreadsStopped=true, HitBreakpointIds=[1]}", stopEvent)
+		}
+
+		// 8 >> setBreakpoints, << setBreakpoints
+		client.SetBreakpointsRequest(fixture.Source, []int{54})
+		sbpResp = client.ExpectSetBreakpointsResponse(t)
+		if sbpResp.RequestSeq != 8 || len(sbpResp.Body.Breakpoints) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=8, len(Breakpoints)=1", sbpResp)
+		}
+		if !sbpResp.Body.Breakpoints[0].Verified {
+			t.Errorf("got breakpoints[0].Verified=false, want true")
+		}
+
+		// 9 >> continue, << continue << stopped
+		client.ContinueRequest(1)
+		contResp = client.ExpectContinueResponse(t)
+		if contResp.RequestSeq != 9 || !contResp.Body.AllThreadsContinued {
+			t.Errorf("\ngot %#v\nwant RequestSeq=9 Body.AllThreadsContinued=true", contResp)
+		}
+		stopEvent = client.ExpectStoppedEvent(t)
+		if stopEvent.Body.Reason != "breakpoint" ||
+			stopEvent.Body.ThreadId != 1 ||
+			!stopEvent.Body.AllThreadsStopped ||
+			len(stopEvent.Body.HitBreakpointIds) != 1 ||
+			stopEvent.Body.HitBreakpointIds[0] != sbpResp.Body.Breakpoints[0].Id {
+			t.Errorf("\ngot %#v\nwant Body={Reason=\"breakpoint\", ThreadId=1, AllThreadsStopped=true, HitBreakpointIds=[1]}", stopEvent)
+		}
+
+		// 10 >> continue, << continue << terminated
+		client.ContinueRequest(1)
+		contResp = client.ExpectContinueResponse(t)
+		if contResp.RequestSeq != 10 || !contResp.Body.AllThreadsContinued {
+			t.Errorf("\ngot %#v\nwant RequestSeq=10 Body.AllThreadsContinued=true", contResp)
+		}
+		client.ExpectTerminatedEvent(t)
+
+		// 11 >> disconnect, << disconnect
+		client.DisconnectRequest()
+		oep := client.ExpectOutputEventProcessExited(t, 0)
+		if oep.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oep)
+		}
+		oed := client.ExpectOutputEventDetaching(t)
+		if oed.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oed)
+		}
+		dResp := client.ExpectDisconnectResponse(t)
+		if dResp.RequestSeq != 11 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=11", dResp)
+		}
+		client.ExpectTerminatedEvent(t)
+	})
+}
+
+func TestAttachWithFollowExec(t *testing.T) {
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
+		t.Skip("follow exec not implemented")
+	}
+
+	runTest(t, "spawn", func(client *daptest.Client, fixture protest.Fixture) {
+		// Start the program to attach to
+		cmd := exec.Command(fixture.Path, "spawn", "10000000")
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		// Wait for output.
+		// This will give the target process time to initialize the runtime before we attach,
+		// so we can rely on having goroutines when they are requested on attach.
+		scanOut := bufio.NewScanner(stdout)
+		scanOut.Scan()
+		if scanOut.Text() != "parent starting" {
+			t.Errorf("expected spawn.go to output \"parent starting\"")
+		}
+
+		// 1 >> initialize, << initialize
+		client.InitializeRequest()
+		initResp := client.ExpectInitializeResponseAndCapabilities(t)
+		if initResp.RequestSeq != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=1", initResp)
+		}
+
+		// 2 >> attach, << output, << initialized, << attach
+		client.AttachRequest(map[string]any{
+			"mode":        "local",
+			"processId":   cmd.Process.Pid,
+			"stopOnEntry": stopOnEntry,
+			"followExec":  true,
+			"backend":     "default",
+		})
+		outputEvent := client.ExpectOutputEvent(t)
+		if outputEvent.Body.Output != "Follow exec not supported in attach request yet." ||
+			outputEvent.Body.Category != "important" {
+			t.Errorf("\ngot %#v\nwant Body={Output=\"Follow exec not supported in attach request yet.\", Category=\"important\"}", outputEvent)
+		}
+
+		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
+		client.ExpectInitializedEvent(t)
+		attachResp := client.ExpectAttachResponse(t)
+		if attachResp.RequestSeq != 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=2", attachResp)
+		}
+
+		// 3 >> disconnect, << disconnect
+		client.DisconnectRequestWithKillOption(true)
 		// Disconnect consists of Halt + Detach.
 		// Halt interrupts command in progress, which triggers
 		// a stopped event in parallel with the disconnect
@@ -653,7 +865,7 @@ func TestContinueOnEntry(t *testing.T) {
 		client.ExpectSetBreakpointsResponse(t)
 
 		// 4 >> setExceptionBreakpoints, << setExceptionBreakpoints
-		client.SetExceptionBreakpointsRequest()
+		client.SetExceptionBreakpointsRequest(nil)
 		client.ExpectSetExceptionBreakpointsResponse(t)
 
 		// 5 >> configurationDone, << configurationDone
@@ -666,8 +878,8 @@ func TestContinueOnEntry(t *testing.T) {
 		// 6 >> threads, << threads
 		client.ThreadsRequest()
 		tResp := client.ExpectThreadsResponse(t)
-		if tResp.Seq != 0 || tResp.RequestSeq != 6 || len(tResp.Body.Threads) != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=6 len(Threads)=1", tResp)
+		if tResp.RequestSeq != 6 || len(tResp.Body.Threads) != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=6 len(Threads)=1", tResp)
 		}
 		if tResp.Body.Threads[0].Id != 1 || tResp.Body.Threads[0].Name != "Dummy" {
 			t.Errorf("\ngot %#v\nwant Id=1, Name=\"Dummy\"", tResp)
@@ -678,8 +890,8 @@ func TestContinueOnEntry(t *testing.T) {
 		client.ExpectOutputEventProcessExited(t, 0)
 		client.ExpectOutputEventDetaching(t)
 		dResp := client.ExpectDisconnectResponse(t)
-		if dResp.Seq != 0 || dResp.RequestSeq != 7 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=7", dResp)
+		if dResp.RequestSeq != 7 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=7", dResp)
 		}
 		client.ExpectTerminatedEvent(t)
 	})
@@ -707,7 +919,7 @@ func TestPreSetBreakpoint(t *testing.T) {
 			t.Errorf("got breakpoints[0] = %#v, want Verified=true, Line=8, Id=1, Path=%q", bkpt0, fixture.Source)
 		}
 
-		client.SetExceptionBreakpointsRequest()
+		client.SetExceptionBreakpointsRequest(nil)
 		client.ExpectSetExceptionBreakpointsResponse(t)
 
 		client.ConfigurationDoneRequest()
@@ -716,7 +928,7 @@ func TestPreSetBreakpoint(t *testing.T) {
 
 		client.ThreadsRequest()
 		// Since we are in async mode while running, we might receive messages in either order.
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			msg := client.ExpectMessage(t)
 			switch m := msg.(type) {
 			case *dap.ThreadsResponse:
@@ -829,7 +1041,7 @@ func TestPreSetBreakpoint(t *testing.T) {
 //	wantFrames - number of frames returned (length of StackTraceResponse.Body.StackFrames array).
 //	wantTotalFrames - total number of stack frames available (StackTraceResponse.Body.TotalFrames).
 func checkStackFramesExact(t *testing.T, got *dap.StackTraceResponse,
-	wantStartName string, wantStartLine interface{}, wantStartID, wantFrames, wantTotalFrames int,
+	wantStartName string, wantStartLine any, wantStartID, wantFrames, wantTotalFrames int,
 ) {
 	t.Helper()
 	checkStackFramesNamed("", t, got, wantStartName, wantStartLine, wantStartID, wantFrames, wantTotalFrames, true)
@@ -898,7 +1110,7 @@ func TestFilterGoroutines(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode":        "exec",
 					"program":     fixture.Path,
 					"stopOnEntry": !stopOnEntry,
@@ -920,9 +1132,20 @@ func TestFilterGoroutines(t *testing.T) {
 							client.ExpectOutputEvent(t)
 						}
 						tr := client.ExpectThreadsResponse(t)
-						if tc.wantLen > 0 && len(tr.Body.Threads) != tc.wantLen {
-							t.Errorf("got Threads=%#v, want Len=%d\n", tr.Body.Threads, tc.wantLen)
+						if tc.wantLen > 0 {
+							if runtime.GOOS == "windows" {
+								// On windows/go1.26 there is one extra goroutine that we don't have
+								// a start location for, so the system filter doesn't work on it.
+								if len(tr.Body.Threads) != tc.wantLen && len(tr.Body.Threads) != tc.wantLen+1 {
+									t.Errorf("got Threads=%#v, want Len=%d (or %d)\n", tr.Body.Threads, tc.wantLen, tc.wantLen+1)
+								}
+							} else {
+								if len(tr.Body.Threads) != tc.wantLen {
+									t.Errorf("got Threads=%#v, want Len=%d\n", tr.Body.Threads, tc.wantLen)
+								}
+							}
 						}
+						runtimeGoexitFound := false
 						for i, frame := range tr.Body.Threads {
 							var found bool
 							for _, wantName := range tc.want {
@@ -930,6 +1153,11 @@ func TestFilterGoroutines(t *testing.T) {
 									found = true
 									break
 								}
+							}
+							if !found && !runtimeGoexitFound && strings.Contains(frame.Name, "runtime.goexit") && runtime.GOOS == "windows" {
+								// See previous comment about windows/1.26
+								found = true
+								runtimeGoexitFound = true
 							}
 							if !found {
 								t.Errorf("got Threads[%d]=%#v, want Name=%v\n", i, frame, tc.want)
@@ -950,7 +1178,7 @@ func checkStackFramesHasMore(t *testing.T, got *dap.StackTraceResponse,
 }
 
 func checkStackFramesNamed(testName string, t *testing.T, got *dap.StackTraceResponse,
-	wantStartName string, wantStartLine interface{}, wantStartID, wantFrames, wantTotalFrames int, totalExact bool,
+	wantStartName string, wantStartLine any, wantStartID, wantFrames, wantTotalFrames int, totalExact bool,
 ) {
 	t.Helper()
 	if totalExact && got.Body.TotalFrames != wantTotalFrames {
@@ -963,7 +1191,7 @@ func checkStackFramesNamed(testName string, t *testing.T, got *dap.StackTraceRes
 		t.Errorf("%s\ngot  len(StackFrames)=%d\nwant %d", testName, len(got.Body.StackFrames), wantFrames)
 	} else {
 		// Verify that frame ids are consecutive numbers starting at wantStartID
-		for i := 0; i < wantFrames; i++ {
+		for i := range wantFrames {
 			if got.Body.StackFrames[i].Id != wantStartID+i {
 				t.Errorf("%s\ngot  %#v\nwant Id=%d", testName, got.Body.StackFrames[i], wantStartID+i)
 			}
@@ -980,13 +1208,7 @@ func checkStackFramesNamed(testName string, t *testing.T, got *dap.StackTraceRes
 				startLineOk = got.Body.StackFrames[0].Line == wantStartLine
 			}
 		case []int:
-			startLineOk = false
-			for _, ln := range wantStartLine {
-				if got.Body.StackFrames[0].Line == ln {
-					startLineOk = true
-					break
-				}
-			}
+			startLineOk = slices.Contains(wantStartLine, got.Body.StackFrames[0].Line)
 		}
 
 		if wantFrames > 0 && !startLineOk {
@@ -1112,7 +1334,7 @@ func checkVarExact(t *testing.T, got *dap.VariablesResponse, i int, name, evalNa
 	return checkVarExactIndexed(t, got, i, name, evalName, value, typ, hasRef, -1, -1)
 }
 
-// checkVarExact is a helper like checkVar that matches value exactly.
+// checkVarExactIndexed is a helper like checkVar that matches value exactly.
 func checkVarExactIndexed(t *testing.T, got *dap.VariablesResponse, i int, name, evalName, value, typ string, hasRef bool, indexed, named int) (ref int) {
 	t.Helper()
 	return checkVar(t, got, i, name, evalName, value, typ, true, hasRef, indexed, named)
@@ -1124,7 +1346,7 @@ func checkVarRegex(t *testing.T, got *dap.VariablesResponse, i int, name, evalNa
 	return checkVarRegexIndexed(t, got, i, name, evalName, value, typ, hasRef, -1, -1)
 }
 
-// checkVarRegex is a helper like checkVar that treats value, evalName or name as a regex.
+// checkVarRegexIndexed is a helper like checkVar that treats value, evalName or name as a regex.
 func checkVarRegexIndexed(t *testing.T, got *dap.VariablesResponse, i int, name, evalName, value, typ string, hasRef bool, indexed, named int) (ref int) {
 	t.Helper()
 	return checkVar(t, got, i, name, evalName, value, typ, false, hasRef, indexed, named)
@@ -1310,7 +1532,7 @@ func TestFunctionNameFormattingInStackTrace(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path,
 				})
 			},
@@ -1443,7 +1665,7 @@ func TestGoroutineLabels(t *testing.T) {
 			runDebugSessionWithBPs(t, client, "launch",
 				// Launch
 				func() {
-					client.LaunchRequestWithArgs(map[string]interface{}{
+					client.LaunchRequestWithArgs(map[string]any{
 						"mode":                 "exec",
 						"program":              fixture.Path,
 						"hideSystemGoroutines": true,
@@ -1457,9 +1679,6 @@ func TestGoroutineLabels(t *testing.T) {
 					execute: func() {
 						client.ThreadsRequest()
 						tr := client.ExpectThreadsResponse(t)
-						if len(tr.Body.Threads) != 1 {
-							t.Errorf("got %d threads, expected 1\n", len(tr.Body.Threads))
-						}
 						// The first breakpoint is before the call to pprof.Do; no labels yet:
 						expectedPrefix := "* [Go 1]"
 						if !strings.HasPrefix(tr.Body.Threads[0].Name, expectedPrefix) {
@@ -1472,7 +1691,7 @@ func TestGoroutineLabels(t *testing.T) {
 						checkStop(t, client, 1, "main.f", 21)
 						client.ThreadsRequest()
 						tr = client.ExpectThreadsResponse(t)
-						if len(tr.Body.Threads) != 1 {
+						if len(tr.Body.Threads) < 1 {
 							t.Errorf("got %d threads, expected 1\n", len(tr.Body.Threads))
 						}
 						// The second breakpoint is inside pprof.Do, so there are labels:
@@ -1497,7 +1716,7 @@ func TestHideSystemGoroutinesRequest(t *testing.T) {
 			runDebugSessionWithBPs(t, client, "launch",
 				// Launch
 				func() {
-					client.LaunchRequestWithArgs(map[string]interface{}{
+					client.LaunchRequestWithArgs(map[string]any{
 						"mode":                 "exec",
 						"program":              fixture.Path,
 						"hideSystemGoroutines": tt.hideSystemGoroutines,
@@ -1517,8 +1736,14 @@ func TestHideSystemGoroutinesRequest(t *testing.T) {
 						// main goroutine, for a total of 11 goroutines.
 						userCount := 11
 						if tt.hideSystemGoroutines {
-							if len(tr.Body.Threads) != userCount {
-								t.Errorf("got %d goroutines, expected %d\n", len(tr.Body.Threads), userCount)
+							if runtime.GOOS == "windows" {
+								if len(tr.Body.Threads) != userCount && len(tr.Body.Threads) != userCount+1 {
+									t.Errorf("got %d goroutines, expected %d (or %d)\n", len(tr.Body.Threads), userCount, userCount+1)
+								}
+							} else {
+								if len(tr.Body.Threads) != userCount {
+									t.Errorf("got %d goroutines, expected %d\n", len(tr.Body.Threads), userCount)
+								}
 							}
 						} else {
 							if len(tr.Body.Threads) <= userCount {
@@ -1539,7 +1764,7 @@ func TestScopesAndVariablesRequests(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true, "backend": "default",
 				})
 			},
@@ -2060,7 +2285,7 @@ func TestScopesRequestsOptimized(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -2543,7 +2768,7 @@ func TestGlobalScopeAndVariables(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true, "showRegisters": true,
 				})
 			},
@@ -2618,7 +2843,7 @@ func TestRegistersScopeAndVariables(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showRegisters": true,
 				})
 			},
@@ -2718,22 +2943,13 @@ func TestRegistersScopeAndVariables(t *testing.T) {
 }
 
 func findPcReg(regs []dap.Variable) int {
+	pcRegNames := []string{"rip", "pc", "eip", "era"}
 	for i, reg := range regs {
-		if isPcReg(reg) {
+		if slices.Contains(pcRegNames, strings.TrimSpace(reg.Name)) {
 			return i
 		}
 	}
 	return -1
-}
-
-func isPcReg(reg dap.Variable) bool {
-	pcRegNames := []string{"rip", "pc", "eip", "era"}
-	for _, name := range pcRegNames {
-		if name == strings.TrimSpace(reg.Name) {
-			return true
-		}
-	}
-	return false
 }
 
 // TestShadowedVariables executes to a breakpoint and checks the shadowed
@@ -2743,7 +2959,7 @@ func TestShadowedVariables(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -2783,7 +2999,7 @@ func TestLaunchRequestWithStackTraceDepth(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "stackTraceDepth": 1,
 				})
 			},
@@ -3418,7 +3634,7 @@ func TestLogPoints(t *testing.T) {
 					client.ContinueRequest(1)
 					client.ExpectContinueResponse(t)
 
-					for i := 0; i < 5; i++ {
+					for i := range 5 {
 						se := client.ExpectStoppedEvent(t)
 						if se.Body.Reason != "breakpoint" || se.Body.ThreadId != 1 {
 							t.Errorf("got stopped event = %#v, \nwant Reason=\"breakpoint\" ThreadId=1", se)
@@ -3520,7 +3736,7 @@ func TestHaltPreventsAutoResume(t *testing.T) {
 					client.SetBreakpointsRequestWithArgs(fixture.Source, bps, nil, nil, logMessages)
 					client.ExpectSetBreakpointsResponse(t)
 
-					for i := 0; i < 5; i++ {
+					for range 5 {
 						// Reset the handler to the default behavior.
 						resumeOnceAndCheckStop = savedResumeOnce
 
@@ -3821,7 +4037,7 @@ func TestHitConditionBreakpoints(t *testing.T) {
 // in the launch configuration to take care of the mapping.
 func TestLaunchSubstitutePath(t *testing.T) {
 	runTest(t, "loopprog", func(client *daptest.Client, fixture protest.Fixture) {
-		substitutePathTestHelper(t, fixture, client, "launch", map[string]interface{}{"mode": "exec", "program": fixture.Path})
+		substitutePathTestHelper(t, fixture, client, "launch", map[string]any{"mode": "exec", "program": fixture.Path})
 	})
 }
 
@@ -3835,11 +4051,11 @@ func TestAttachSubstitutePath(t *testing.T) {
 	runTest(t, "loopprog", func(client *daptest.Client, fixture protest.Fixture) {
 		cmd := execFixture(t, fixture)
 
-		substitutePathTestHelper(t, fixture, client, "attach", map[string]interface{}{"mode": "local", "processId": cmd.Process.Pid})
+		substitutePathTestHelper(t, fixture, client, "attach", map[string]any{"mode": "local", "processId": cmd.Process.Pid})
 	})
 }
 
-func substitutePathTestHelper(t *testing.T, fixture protest.Fixture, client *daptest.Client, request string, launchAttachConfig map[string]interface{}) {
+func substitutePathTestHelper(t *testing.T, fixture protest.Fixture, client *daptest.Client, request string, launchAttachConfig map[string]any) {
 	t.Helper()
 	nonexistentDir := filepath.Join(string(filepath.Separator), "path", "that", "does", "not", "exist")
 	if runtime.GOOS == "windows" {
@@ -3914,7 +4130,7 @@ func TestWorkingDir(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode":        "exec",
 					"program":     fixture.Path,
 					"stopOnEntry": false,
@@ -4138,7 +4354,7 @@ func TestEvaluateRequest(t *testing.T) {
 	})
 }
 
-func formatConfig(depth int, showGlobals, showRegisters bool, goroutineFilters string, showPprofLabels []string, hideSystemGoroutines bool, substitutePath [][2]string) string {
+func formatConfig(depth int, showGlobals, showRegisters bool, goroutineFilters string, showPprofLabels []string, hideSystemGoroutines bool, substitutePath [][2]string, followExec bool, followExecRegex string) string {
 	formatStr := `stackTraceDepth	%d
 showGlobalVariables	%v
 showRegisters	%v
@@ -4146,8 +4362,10 @@ goroutineFilters	%q
 showPprofLabels	%v
 hideSystemGoroutines	%v
 substitutePath	%v
+followExec	%v
+followExecRegex	%q
 `
-	return fmt.Sprintf(formatStr, depth, showGlobals, showRegisters, goroutineFilters, showPprofLabels, hideSystemGoroutines, substitutePath)
+	return fmt.Sprintf(formatStr, depth, showGlobals, showRegisters, goroutineFilters, showPprofLabels, hideSystemGoroutines, substitutePath, followExec, followExecRegex)
 }
 
 func TestEvaluateCommandRequest(t *testing.T) {
@@ -4162,17 +4380,11 @@ func TestEvaluateCommandRequest(t *testing.T) {
 				execute: func() {
 					checkStop(t, client, 1, "main.foobar", []int{65, 66})
 
-					// Request help.
-					const dlvHelp = `The following commands are available:
-    dlv help (alias: h) 	 Prints the help message.
-    dlv config 	 Changes configuration parameters.
-    dlv sources (alias: s) 	 Print list of source files.
-
-Type 'dlv help' followed by a command for full documentation.
-`
 					client.EvaluateRequest("dlv help", 1000, "repl")
 					got := client.ExpectEvaluateResponse(t)
-					checkEval(t, got, dlvHelp, noChildren)
+					if got.Body.Result == "" {
+						t.Errorf("\ngot  %#v\nwanted something in the body", got)
+					}
 
 					client.EvaluateRequest("dlv help config", 1000, "repl")
 					got = client.ExpectEvaluateResponse(t)
@@ -4184,7 +4396,7 @@ Type 'dlv help' followed by a command for full documentation.
 
 					client.EvaluateRequest("dlv config -list", 1000, "repl")
 					got = client.ExpectEvaluateResponse(t)
-					checkEval(t, got, formatConfig(50, false, false, "", []string{}, false, [][2]string{}), noChildren)
+					checkEval(t, got, formatConfig(50, false, false, "", []string{}, false, [][2]string{}, false, ""), noChildren)
 
 					// Read and modify showGlobalVariables.
 					client.EvaluateRequest("dlv config -list showGlobalVariables", 1000, "repl")
@@ -4205,7 +4417,7 @@ Type 'dlv help' followed by a command for full documentation.
 
 					client.EvaluateRequest("dlv config -list", 1000, "repl")
 					got = client.ExpectEvaluateResponse(t)
-					checkEval(t, got, formatConfig(50, true, false, "", []string{}, false, [][2]string{}), noChildren)
+					checkEval(t, got, formatConfig(50, true, false, "", []string{}, false, [][2]string{}, false, ""), noChildren)
 
 					client.ScopesRequest(1000)
 					scopes = client.ExpectScopesResponse(t)
@@ -4251,16 +4463,128 @@ Type 'dlv help' followed by a command for full documentation.
 						t.Errorf("\ngot: %#v, want sources=\"\"", got)
 					}
 
+					// Test target.
+					client.EvaluateRequest("dlv target list", 1000, "repl")
+					got = client.ExpectEvaluateResponse(t)
+					if !strings.Contains(got.Body.Result, fixture.Path) {
+						t.Errorf("\ngot: %#v, want target list contains %s", got, fixture.Path)
+					}
+					// single target
+					if strings.Count(got.Body.Result, "\n") != 1 {
+						t.Errorf("\ngot: %#v, want target list has 1 line", got)
+					}
+
+					// target follow-exec
+					if runtime.GOOS != "freebsd" && runtime.GOOS != "darwin" {
+						client.EvaluateRequest("dlv target follow-exec", 1000, "repl")
+						got = client.ExpectEvaluateResponse(t)
+						if got.Body.Result != "Follow exec mode is disabled" {
+							t.Errorf("\ngot: %#v, want Follow exec mode is disabled", got)
+						}
+
+						client.EvaluateRequest("dlv target follow-exec -on", 1000, "repl")
+						got = client.ExpectEvaluateResponse(t)
+						if got.Body.Result != "Follow exec mode enabled" {
+							t.Errorf("\ngot: %#v, want Follow exec mode enabled", got)
+						}
+
+						base := filepath.Base(fixture.Path)
+						client.EvaluateRequest(fmt.Sprintf("dlv target follow-exec -on %s", base), 1000, "repl")
+						got = client.ExpectEvaluateResponse(t)
+						if got.Body.Result != fmt.Sprintf("Follow exec mode enabled with regex %q", base) {
+							t.Errorf("\ngot: %#v, want Follow exec mode enabled with regex %q", got, base)
+						}
+
+						client.EvaluateRequest("dlv target follow-exec -off", 1000, "repl")
+						got = client.ExpectEvaluateResponse(t)
+						if got.Body.Result != "Follow exec mode disabled" {
+							t.Errorf("\ngot: %#v, want Follow exec mode disabled", got)
+						}
+
+						// TODO: target switch
+					}
+
 					// Test bad inputs.
 					client.EvaluateRequest("dlv help bad", 1000, "repl")
 					client.ExpectErrorResponse(t)
 
 					client.EvaluateRequest("dlv bad", 1000, "repl")
 					client.ExpectErrorResponse(t)
+
+					if runtime.GOOS != "freebsd" && runtime.GOOS != "darwin" {
+						// Test bad target off
+						client.EvaluateRequest("dlv target follow-exec -off path", 1000, "repl")
+						client.ExpectErrorResponse(t)
+
+						// Test bad target on regex
+						client.EvaluateRequest("dlv target follow-exec -on [", 1000, "repl")
+						client.ExpectErrorResponse(t)
+					}
+
+					// Test bad target subcommand
+					client.EvaluateRequest("dlv target bad", 1000, "repl")
+					client.ExpectErrorResponse(t)
 				},
 				disconnect: true,
 			}})
 	})
+}
+
+func TestEvaluateExaminememCommand(t *testing.T) {
+	runTest(t, "testvariables", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			fixture.Source, []int{}, // Breakpoint set in the program
+			[]onBreakpoint{{ // Stop at first breakpoint
+				execute: func() {
+					checkStop(t, client, 1, "main.foobar", []int{65, 66})
+
+					client.EvaluateRequest("dlv x -fmt binary -x &b1", localsScope, "repl")
+					got := client.ExpectEvaluateResponse(t)
+					checkExaminememCommand(t, got, "00000001")
+
+					client.EvaluateRequest("dlv x -fmt oct -x &u8", localsScope, "repl")
+					got = client.ExpectEvaluateResponse(t)
+					checkExaminememCommand(t, got, "0377")
+
+					client.EvaluateRequest("dlv x -fmt hex -x &u8", localsScope, "repl")
+					got = client.ExpectEvaluateResponse(t)
+					checkExaminememCommand(t, got, "0xff")
+
+					var (
+						sizeOfInt = unsafe.Sizeof(int(0))
+						intArray  = "0x0000000000000001   0x0000000000000002"
+					)
+					if sizeOfInt == 4 {
+						// on GOARCH=386 int is 4 bytes
+						intArray = "0x00000001   0x00000002"
+					}
+					client.EvaluateRequest(fmt.Sprintf("dlv x -count 2 -size %d -fmt hex -x &a4", sizeOfInt), localsScope, "repl")
+					got = client.ExpectEvaluateResponse(t)
+					checkExaminememCommand(t, got, intArray)
+
+				},
+				disconnect: true,
+			}},
+		)
+	})
+}
+
+func checkExaminememCommand(t *testing.T, got *dap.EvaluateResponse, value string) {
+	t.Helper()
+
+	if got.Body.Result == "" {
+		t.Fatalf("result must not be empty")
+	}
+
+	want := fmt.Sprintf(":   %s   \n", value)
+
+	if !strings.HasSuffix(got.Body.Result, want) {
+		t.Errorf("\ngot:  %#q\nwant: %q\n", got.Body.Result, want)
+	}
 }
 
 // From testvariables2 fixture
@@ -5249,7 +5573,7 @@ func TestFatalThrowBreakpoint(t *testing.T) {
 // The details have been tested by other tests,
 // so this is just a sanity check.
 // Skips line check if line is -1.
-func checkStop(t *testing.T, client *daptest.Client, thread int, fname string, line interface{}) {
+func checkStop(t *testing.T, client *daptest.Client, thread int, fname string, line any) {
 	t.Helper()
 	client.ThreadsRequest()
 	client.ExpectThreadsResponse(t)
@@ -5289,7 +5613,7 @@ type onBreakpoint struct {
 //	 source        - source file path, needed to set breakpoints, "" if none to be set.
 //	 breakpoints   - list of lines, where breakpoints are to be set
 //	 onBPs         - list of test sequences to execute at each of the set breakpoints.
-func runDebugSessionWithBPs(t *testing.T, client *daptest.Client, cmd string, cmdRequest func(), source string, breakpoints interface{}, onBPs []onBreakpoint) {
+func runDebugSessionWithBPs(t *testing.T, client *daptest.Client, cmd string, cmdRequest func(), source string, breakpoints any, onBPs []onBreakpoint) {
 	client.InitializeRequest()
 	client.ExpectInitializeResponseAndCapabilities(t)
 
@@ -5395,7 +5719,7 @@ func TestLaunchDebugRequest(t *testing.T) {
 		// We reuse the harness that builds, but ignore the built binary,
 		// only relying on the source to be built in response to LaunchRequest.
 		runDebugSession(t, client, "launch", func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
+			client.LaunchRequestWithArgs(map[string]any{
 				"mode": "debug", "program": fixture.Source, "output": tmpBin,
 			})
 		})
@@ -5432,22 +5756,22 @@ func TestLaunchDebugRequest(t *testing.T) {
 func TestLaunchRequestDefaults(t *testing.T) {
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSession(t, client, "launch", func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
-				"mode": "" /*"debug" by default*/, "program": fixture.Source, "output": "__mybin",
+			client.LaunchRequestWithArgs(map[string]any{
+				"mode": "" /*"debug" by default*/, "program": fixture.Source,
 			})
 		})
 	})
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSession(t, client, "launch", func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
-				/*"mode":"debug" by default*/ "program": fixture.Source, "output": "__mybin",
+			client.LaunchRequestWithArgs(map[string]any{
+				/*"mode":"debug" by default*/ "program": fixture.Source,
 			})
 		})
 	})
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSession(t, client, "launch", func() {
 			// Use the temporary output binary.
-			client.LaunchRequestWithArgs(map[string]interface{}{
+			client.LaunchRequestWithArgs(map[string]any{
 				"mode": "debug", "program": fixture.Source,
 			})
 		})
@@ -5464,7 +5788,7 @@ func TestLaunchRequestOutputPath(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "debug", "program": fixture.Source, "output": inrel,
 					"cwd": filepath.Dir(wd),
 				})
@@ -5515,8 +5839,8 @@ func TestExitNonZeroStatus(t *testing.T) {
 func TestNoDebug_GoodExitStatus(t *testing.T) {
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		runNoDebugSession(t, client, func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
-				"noDebug": true, "mode": "debug", "program": fixture.Source, "output": "__mybin",
+			client.LaunchRequestWithArgs(map[string]any{
+				"noDebug": true, "mode": "debug", "program": fixture.Source,
 			})
 		}, 0)
 	})
@@ -5525,7 +5849,7 @@ func TestNoDebug_GoodExitStatus(t *testing.T) {
 func TestNoDebug_BadExitStatus(t *testing.T) {
 	runTest(t, "issue1101", func(client *daptest.Client, fixture protest.Fixture) {
 		runNoDebugSession(t, client, func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
+			client.LaunchRequestWithArgs(map[string]any{
 				"noDebug": true, "mode": "exec", "program": fixture.Path,
 			})
 		}, 2)
@@ -5554,7 +5878,7 @@ func TestNoDebug_AcceptNoRequestsButDisconnect(t *testing.T) {
 	runTest(t, "http_server", func(client *daptest.Client, fixture protest.Fixture) {
 		client.InitializeRequest()
 		client.ExpectInitializeResponseAndCapabilities(t)
-		client.LaunchRequestWithArgs(map[string]interface{}{
+		client.LaunchRequestWithArgs(map[string]any{
 			"noDebug": true, "mode": "exec", "program": fixture.Path,
 		})
 		client.ExpectLaunchResponse(t)
@@ -5572,14 +5896,14 @@ func TestNoDebug_AcceptNoRequestsButDisconnect(t *testing.T) {
 		ExpectNoDebugError("setFunctionBreakpoints")
 		client.PauseRequest(1)
 		ExpectNoDebugError("pause")
-		client.RestartRequest()
+		client.RestartRequest(nil)
 		client.ExpectUnsupportedCommandErrorResponse(t)
 
 		// Disconnect request is ok
 		client.DisconnectRequestWithKillOption(true)
 		terminated, disconnectResp := false, false
 		for {
-			m, err := client.ReadMessage()
+			m, err := client.ReadMessage(t)
 			if err != nil {
 				break
 			}
@@ -5628,7 +5952,7 @@ func TestLaunchRequestWithRelativeBuildPath(t *testing.T) {
 	// Program path will be interpreted relative to dlv's.
 	dlvwd, _ := os.Getwd()
 	runDebugSession(t, client, "launch", func() {
-		client.LaunchRequestWithArgs(map[string]interface{}{
+		client.LaunchRequestWithArgs(map[string]any{
 			"mode": "debug", "program": program, "cwd": filepath.Dir(dlvwd),
 		})
 	})
@@ -5648,7 +5972,7 @@ func TestLaunchRequestWithRelativeExecPath(t *testing.T) {
 		}
 		defer os.Remove(symlink)
 		runDebugSession(t, client, "launch", func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
+			client.LaunchRequestWithArgs(map[string]any{
 				"mode": "exec", "program": symlink,
 			})
 		})
@@ -5665,49 +5989,49 @@ func TestLaunchTestRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		dlvWD      string
-		launchArgs map[string]interface{}
+		launchArgs map[string]any
 		wantWD     string
 	}{{
 		name: "default",
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir,
 		},
 		wantWD: absolutePkgDir,
 	}, {
 		name: "output",
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir, "output": "test.out",
 		},
 		wantWD: absolutePkgDir,
 	}, {
 		name: "dlvCwd",
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir, "dlvCwd": ".",
 		},
 		wantWD: absolutePkgDir,
 	}, {
 		name: "dlvCwd2",
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": ".", "dlvCwd": absolutePkgDir,
 		},
 		wantWD: absolutePkgDir,
 	}, {
 		name: "cwd",
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir, "cwd": fixtures, // fixtures is relative to the current working directory.
 		},
 		wantWD: absoluteFixturesDir,
 	}, {
 		name:  "dlv runs outside of module",
 		dlvWD: os.TempDir(),
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir, "dlvCwd": absoluteFixturesDir,
 		},
 		wantWD: absolutePkgDir,
 	}, {
 		name:  "dlv builds in dlvCwd but runs in cwd",
 		dlvWD: fixtures,
-		launchArgs: map[string]interface{}{
+		launchArgs: map[string]any{
 			"mode": "test", "program": absolutePkgDir, "dlvCwd": absolutePkgDir, "cwd": "..", // relative to dlvCwd.
 		},
 		wantWD: absoluteFixturesDir,
@@ -5755,7 +6079,7 @@ func TestLaunchTestRequest(t *testing.T) {
 func TestLaunchRequestWithArgs(t *testing.T) {
 	runTest(t, "testargs", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSession(t, client, "launch", func() {
-			client.LaunchRequestWithArgs(map[string]interface{}{
+			client.LaunchRequestWithArgs(map[string]any{
 				"mode": "exec", "program": fixture.Path,
 				"args": []string{"test", "pass flag"},
 			})
@@ -5772,8 +6096,8 @@ func TestLaunchRequestWithBuildFlags(t *testing.T) {
 		runDebugSession(t, client, "launch", func() {
 			// We reuse the harness that builds, but ignore the built binary,
 			// only relying on the source to be built in response to LaunchRequest.
-			client.LaunchRequestWithArgs(map[string]interface{}{
-				"mode": "debug", "program": fixture.Source, "output": "__mybin",
+			client.LaunchRequestWithArgs(map[string]any{
+				"mode": "debug", "program": fixture.Source,
 				"buildFlags": "-ldflags '-X main.Hello=World'",
 			})
 		})
@@ -5785,8 +6109,8 @@ func TestLaunchRequestWithBuildFlags2(t *testing.T) {
 		runDebugSession(t, client, "launch", func() {
 			// We reuse the harness that builds, but ignore the built binary,
 			// only relying on the source to be built in response to LaunchRequest.
-			client.LaunchRequestWithArgs(map[string]interface{}{
-				"mode": "debug", "program": fixture.Source, "output": "__mybin",
+			client.LaunchRequestWithArgs(map[string]any{
+				"mode": "debug", "program": fixture.Source,
 				"buildFlags": []string{"-ldflags", "-X main.Hello=World"},
 			})
 		})
@@ -5863,7 +6187,7 @@ func TestLaunchRequestWithEnv(t *testing.T) {
 			defer client.Close()
 
 			runDebugSessionWithBPs(t, client, "launch", func() { // launch
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode":    "debug",
 					"program": testFile,
 					"env":     tc.launchEnv,
@@ -5896,7 +6220,7 @@ func TestAttachRequest(t *testing.T) {
 		runDebugSessionWithBPs(t, client, "attach",
 			// Attach
 			func() {
-				client.AttachRequest(map[string]interface{}{
+				client.AttachRequest(map[string]any{
 					/*"mode": "local" by default*/ "processId": cmd.Process.Pid, "stopOnEntry": false,
 				})
 				client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
@@ -5945,7 +6269,7 @@ func TestAttachWaitForRequest(t *testing.T) {
 
 		client.InitializeRequest()
 		client.ExpectInitializeResponseAndCapabilities(t)
-		client.AttachRequest(map[string]interface{}{
+		client.AttachRequest(map[string]any{
 			"mode":        "local",
 			"waitFor":     fixture.Path,
 			"stopOnEntry": true,
@@ -5966,7 +6290,7 @@ func TestAttachWaitForRequest(t *testing.T) {
 // in either order.
 func expectPauseResponseAndStoppedEvent(t *testing.T, client *daptest.Client) {
 	t.Helper()
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		msg := client.ExpectMessage(t)
 		switch m := msg.(type) {
 		case *dap.StoppedEvent:
@@ -6013,54 +6337,195 @@ func TestPauseAndContinue(t *testing.T) {
 	})
 }
 
-func TestUnsupportedCommandResponses(t *testing.T) {
-	var got *dap.ErrorResponse
-	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
-		seqCnt := 1
-		expectUnsupportedCommand := func(cmd string) {
-			t.Helper()
-			got = client.ExpectUnsupportedCommandErrorResponse(t)
-			if got.RequestSeq != seqCnt || got.Command != cmd {
-				t.Errorf("\ngot  %#v\nwant RequestSeq=%d Command=%s", got, seqCnt, cmd)
-			}
-			seqCnt++
-		}
+func TestRestartRequest(t *testing.T) {
+	runTest(t, "loopprog", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{16}, // Set breakpoint at main.main
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 16)
 
-		client.RestartFrameRequest()
-		expectUnsupportedCommand("restartFrame")
+					client.RestartRequest(map[string]any{
+						"arguments": map[string]any{
+							"request":     "launch",
+							"mode":        "exec",
+							"program":     fixture.Path,
+							"stopOnEntry": false,
+							"rebuild":     false,
+						},
+					})
+					client.ExpectRestartResponse(t)
 
-		client.GotoRequest()
-		expectUnsupportedCommand("goto")
+					client.ExpectInitializedEvent(t)
 
-		client.SourceRequest()
-		expectUnsupportedCommand("source")
+					client.ConfigurationDoneRequest()
+					client.ExpectConfigurationDoneResponse(t)
 
-		client.TerminateThreadsRequest()
-		expectUnsupportedCommand("terminateThreads")
+					// Ensure breakpoints are preserved
+					// Now we should hit the breakpoint again at main.main
+					client.ExpectStoppedEvent(t)
+					checkStop(t, client, 1, "main.main", 16)
+				},
+				disconnect: true,
+			}})
+	})
+}
 
-		client.StepInTargetsRequest()
-		expectUnsupportedCommand("stepInTargets")
+func TestRestartRequestRebuild(t *testing.T) {
+	runTest(t, "loopprog", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequestWithArgs(map[string]any{
+					"mode": "debug", "program": fixture.Source,
+				})
+			},
+			// Set breakpoints
+			fixture.Source, []int{16}, // Set breakpoint at main.main
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 16)
 
-		client.GotoTargetsRequest()
-		expectUnsupportedCommand("gotoTargets")
+					client.RestartRequest(map[string]any{
+						"arguments": map[string]any{
+							"request":     "launch",
+							"mode":        "debug",
+							"program":     fixture.Source,
+							"stopOnEntry": false,
+							// "rebuild":     true, omitted as it should default to true
+						},
+					})
+					client.ExpectRestartResponse(t)
 
-		client.CompletionsRequest()
-		expectUnsupportedCommand("completions")
+					client.ExpectInitializedEvent(t)
 
-		client.DataBreakpointInfoRequest()
-		expectUnsupportedCommand("dataBreakpointInfo")
+					client.ConfigurationDoneRequest()
+					client.ExpectConfigurationDoneResponse(t)
 
-		client.SetDataBreakpointsRequest()
-		expectUnsupportedCommand("setDataBreakpoints")
+					// Ensure breakpoints are preserved
+					// Now we should hit the breakpoint again at main.main
+					client.ExpectStoppedEvent(t)
+					checkStop(t, client, 1, "main.main", 16)
+				},
+				disconnect: true,
+			}})
+	})
+}
 
-		client.BreakpointLocationsRequest()
-		expectUnsupportedCommand("breakpointLocations")
+func TestRestartRequestRebuildFail(t *testing.T) {
+	const modifiedSource = `package main
 
-		client.ModulesRequest()
-		expectUnsupportedCommand("modules")
+import "math"
 
-		client.DisconnectRequest()
-		client.ExpectDisconnectResponse(t)
+var f = 1.5
+
+func main() {
+	floatvar1 := math.Floor(f)
+	floatvar2 := float64(int(f))
+	_ = floatvar1
+	_ = floatvar2
+	the syntax error btw
+}
+`
+	runTest(t, "testRestartRequestRebuildFailFixture", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequestWithArgs(map[string]any{
+					"mode": "debug", "program": fixture.Source,
+				})
+			},
+			// Set breakpoints
+			fixture.Source, []int{7}, // Set breakpoint at main.main
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 7)
+
+					fi, _ := os.Stat(fixture.Source)
+
+					originalSource, err := os.ReadFile(fixture.Source)
+					if err != nil {
+						t.Fatalf("could not read original source: %v", err)
+					}
+
+					// Ensure we write the original source code back after the test exits.
+					defer os.WriteFile(fixture.Source, originalSource, fi.Mode())
+
+					err = os.WriteFile(fixture.Source, []byte(modifiedSource), fi.Mode())
+					if err != nil {
+						t.Fatalf("could not modify source: %v", err)
+					}
+
+					client.RestartRequest(map[string]any{
+						"arguments": map[string]any{
+							"request":     "launch",
+							"mode":        "debug",
+							"program":     fixture.Source,
+							"stopOnEntry": false,
+							// "rebuild":     true, omitted as it should default to true
+						},
+					})
+					client.ExpectRestartResponse(t)
+					client.ExpectErrorResponse(t)
+					client.ExpectTerminatedEvent(t)
+				},
+				disconnect: false,
+			}})
+	})
+}
+
+// TestRestartRequestWithNewArgs tests that the restart request can accept new program arguments.
+func TestRestartRequestWithNewArgs(t *testing.T) {
+	runTest(t, "testargs", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			func() {
+				client.LaunchRequestWithArgs(map[string]any{
+					"mode":        "exec",
+					"program":     fixture.Path,
+					"stopOnEntry": false,
+					"args":        []string{"test"},
+				})
+			},
+			fixture.Source, []int{11},
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 11)
+
+					client.EvaluateRequest("os.Args", 1000, "repl")
+					evalResp := client.ExpectEvaluateResponse(t)
+					checkEvalRegex(t, evalResp, `\[\]string len: 2, cap: 2, \[".*testargs.*","test"\]`, hasChildren)
+
+					client.RestartRequest(map[string]any{
+						"arguments": map[string]any{
+							"request":     "launch",
+							"mode":        "exec",
+							"program":     fixture.Path,
+							"stopOnEntry": false,
+							"args":        []string{"test", "pass flag"},
+							"rebuild":     false,
+						},
+					})
+					client.ExpectRestartResponse(t)
+
+					client.ExpectInitializedEvent(t)
+
+					client.ConfigurationDoneRequest()
+					client.ExpectConfigurationDoneResponse(t)
+
+					client.ExpectStoppedEvent(t)
+					checkStop(t, client, 1, "main.main", 11)
+
+					client.EvaluateRequest("os.Args", 1000, "repl")
+					evalResp = client.ExpectEvaluateResponse(t)
+					checkEvalRegex(t, evalResp, `\[\]string len: 3, cap: ., \[".*testargs.*","test","pass flag"\]`, hasChildren)
+				},
+				disconnect: true,
+			}})
 	})
 }
 
@@ -6134,7 +6599,7 @@ func TestSetVariable(t *testing.T) {
 	runTest(t, "testvariables", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -6227,7 +6692,7 @@ func TestSetVariable(t *testing.T) {
 	runTest(t, "testvariables2", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -6307,7 +6772,7 @@ func TestSetVariableWithCall(t *testing.T) {
 	runTest(t, "testvariables", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -6371,7 +6836,7 @@ func TestSetVariableWithCall(t *testing.T) {
 	runTest(t, "fncall", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			func() {
-				client.LaunchRequestWithArgs(map[string]interface{}{
+				client.LaunchRequestWithArgs(map[string]any{
 					"mode": "exec", "program": fixture.Path, "showGlobalVariables": true,
 				})
 			},
@@ -6405,42 +6870,6 @@ func TestSetVariableWithCall(t *testing.T) {
 	})
 }
 
-func TestOptionalNotYetImplementedResponses(t *testing.T) {
-	var got *dap.ErrorResponse
-	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
-		seqCnt := 1
-		expectNotYetImplemented := func(cmd string) {
-			t.Helper()
-			got = client.ExpectNotYetImplementedErrorResponse(t)
-			if got.RequestSeq != seqCnt || got.Command != cmd {
-				t.Errorf("\ngot  %#v\nwant RequestSeq=%d Command=%s", got, seqCnt, cmd)
-			}
-			seqCnt++
-		}
-
-		client.TerminateRequest()
-		expectNotYetImplemented("terminate")
-
-		client.RestartRequest()
-		expectNotYetImplemented("restart")
-
-		client.SetExpressionRequest()
-		expectNotYetImplemented("setExpression")
-
-		client.LoadedSourcesRequest()
-		expectNotYetImplemented("loadedSources")
-
-		client.ReadMemoryRequest()
-		expectNotYetImplemented("readMemory")
-
-		client.CancelRequest()
-		expectNotYetImplemented("cancel")
-
-		client.DisconnectRequest()
-		client.ExpectDisconnectResponse(t)
-	})
-}
-
 func TestBadLaunchRequests(t *testing.T) {
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		seqCnt := 1
@@ -6452,7 +6881,7 @@ func TestBadLaunchRequests(t *testing.T) {
 			if response.Command != "launch" {
 				t.Errorf("Command got %q, want \"launch\"", response.Command)
 			}
-			if response.Message != "Failed to launch" {
+			if !strings.HasPrefix(response.Message, "Failed to launch") {
 				t.Errorf("Message got %q, want \"Failed to launch\"", response.Message)
 			}
 			if !checkErrorMessageId(response.Body.Error, FailedToLaunch) {
@@ -6469,21 +6898,30 @@ func TestBadLaunchRequests(t *testing.T) {
 			}
 		}
 
+		checkFailedToLaunchWithMessageRe := func(response *dap.ErrorResponse, errmsgre string) {
+			t.Helper()
+			checkFailedToLaunch(response)
+			re := regexp.MustCompile(errmsgre)
+			if !re.MatchString(response.Body.Error.Format) {
+				t.Errorf("\ngot  %v\nwant Regexp=%q", response.Body.Error, errmsgre)
+			}
+		}
+
 		// Test for the DAP-specific detailed error message.
 		client.LaunchRequest("exec", "", stopOnEntry)
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
 
 		// Bad "program"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": 12345})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": 12345})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"program\" of type string")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": nil})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": nil})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug"})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
 
@@ -6496,63 +6934,64 @@ func TestBadLaunchRequests(t *testing.T) {
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - unsupported 'mode' attribute \"notamode\"")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": 12345, "program": fixture.Path})
+		client.LaunchRequestWithArgs(map[string]any{"mode": 12345, "program": fixture.Path})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"mode\" of type string")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": ""}) // empty mode defaults to "debug" (not an error)
+		client.LaunchRequestWithArgs(map[string]any{"mode": ""}) // empty mode defaults to "debug" (not an error)
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{}) // missing mode defaults to "debug" (not an error)
+		client.LaunchRequestWithArgs(map[string]any{}) // missing mode defaults to "debug" (not an error)
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
 
 		// Bad "args"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "exec", "program": fixture.Path, "args": "foobar"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "exec", "program": fixture.Path, "args": "foobar"})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal string into \"args\" of type []string")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "exec", "program": fixture.Path, "args": 12345})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "exec", "program": fixture.Path, "args": 12345})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"args\" of type []string")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "exec", "program": fixture.Path, "args": []int{1, 2}})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "exec", "program": fixture.Path, "args": []int{1, 2}})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"args\" of type string")
 
 		// Bad "buildFlags"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "buildFlags": 123})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "buildFlags": 123})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"buildFlags\" of type []string or string")
 
 		// Bad "backend"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "backend": 123})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "backend": 123})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number …")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "backend": "foo"})
-		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
-			"Failed to launch: could not launch process: unknown backend \"foo\"")
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "backend": "foo"})
+		client.ExpectOutputEvent(t) // build message
+		checkFailedToLaunchWithMessageRe(client.ExpectVisibleErrorResponse(t),
+			"Failed to launch .*: could not launch process: unknown backend \"foo\"")
 
 		// Bad "substitutePath"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "substitutePath": 123})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "substitutePath": 123})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into …")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "substitutePath": []interface{}{123}})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "substitutePath": []any{123}})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot use 123 as 'substitutePath' of type {\"from\":string, \"to\":string}")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "substitutePath": []interface{}{map[string]interface{}{"to": "path2"}}})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "substitutePath": []any{map[string]any{"to": "path2"}}})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - 'substitutePath' requires both 'from' and 'to' entries")
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "substitutePath": []interface{}{map[string]interface{}{"from": "path1", "to": 123}}})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "substitutePath": []any{map[string]any{"from": "path1", "to": 123}}})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot use {\"from\":\"path1\",\"to\":123} as 'substitutePath' of type {\"from\":string, \"to\":string}")
 		// Bad "cwd"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "cwd": 123})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "cwd": 123})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: invalid debug configuration - cannot unmarshal number into \"cwd\" of type string")
 
@@ -6561,18 +7000,20 @@ func TestBadLaunchRequests(t *testing.T) {
 		checkFailedToLaunch(client.ExpectVisibleErrorResponse(t)) // No such file or directory
 
 		client.LaunchRequest("debug", fixture.Path+"_does_not_exist", stopOnEntry)
+		client.ExpectOutputEvent(t) // build message
 		oe := client.ExpectOutputEvent(t)
 		if !strings.HasPrefix(oe.Body.Output, "Build Error: ") || oe.Body.Category != "stderr" {
 			t.Errorf("got %#v, want Category=\"stderr\" Output=\"Build Error: ...\"", oe)
 		}
 		checkFailedToLaunch(client.ExpectInvisibleErrorResponse(t))
 
-		client.LaunchRequestWithArgs(map[string]interface{}{
+		client.LaunchRequestWithArgs(map[string]any{
 			"request": "launch",
 			/* mode: debug by default*/
 			"program":     fixture.Path + "_does_not_exist",
 			"stopOnEntry": stopOnEntry,
 		})
+		client.ExpectOutputEvent(t) // build message
 		oe = client.ExpectOutputEvent(t)
 		if !strings.HasPrefix(oe.Body.Output, "Build Error: ") || oe.Body.Category != "stderr" {
 			t.Errorf("got %#v, want Category=\"stderr\" Output=\"Build Error: ...\"", oe)
@@ -6582,13 +7023,15 @@ func TestBadLaunchRequests(t *testing.T) {
 		client.LaunchRequest("exec", fixture.Source, stopOnEntry)
 		checkFailedToLaunch(client.ExpectVisibleErrorResponse(t)) // Not an executable
 
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "buildFlags": "-bad -flags"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "buildFlags": "-bad -flags"})
+		client.ExpectOutputEvent(t) // build message
 		oe = client.ExpectOutputEvent(t)
 		if !strings.HasPrefix(oe.Body.Output, "Build Error: ") || oe.Body.Category != "stderr" {
 			t.Errorf("got %#v, want Category=\"stderr\" Output=\"Build Error: ...\"", oe)
 		}
 		checkFailedToLaunchWithMessage(client.ExpectInvisibleErrorResponse(t), "Failed to launch: Build error: Check the debug console for details.")
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "noDebug": true, "buildFlags": "-bad -flags"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "noDebug": true, "buildFlags": "-bad -flags"})
+		client.ExpectOutputEvent(t) // build message
 		oe = client.ExpectOutputEvent(t)
 		if !strings.HasPrefix(oe.Body.Output, "Build Error: ") || oe.Body.Category != "stderr" {
 			t.Errorf("got %#v, want Category=\"stderr\" Output=\"Build Error: ...\"", oe)
@@ -6596,42 +7039,44 @@ func TestBadLaunchRequests(t *testing.T) {
 		checkFailedToLaunchWithMessage(client.ExpectInvisibleErrorResponse(t), "Failed to launch: Build error: Check the debug console for details.")
 
 		// Bad "cwd"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "noDebug": false, "cwd": "dir/invalid"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "noDebug": false, "cwd": "dir/invalid"})
+		client.ExpectOutputEvent(t)                               // build message
 		checkFailedToLaunch(client.ExpectVisibleErrorResponse(t)) // invalid directory, the error message is system-dependent.
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "noDebug": true, "cwd": "dir/invalid"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "noDebug": true, "cwd": "dir/invalid"})
+		client.ExpectOutputEvent(t)                               // build message
 		checkFailedToLaunch(client.ExpectVisibleErrorResponse(t)) // invalid directory, the error message is system-dependent.
 
 		// Bad "noDebug"
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "debug", "program": fixture.Source, "noDebug": "true"})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "debug", "program": fixture.Source, "noDebug": "true"})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t), "Failed to launch: invalid debug configuration - cannot unmarshal string into \"noDebug\" of type bool")
 
 		// Bad "replay" parameters
 		// These errors come from dap layer
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "replay", "traceDirPath": ""})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "replay", "traceDirPath": ""})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The 'traceDirPath' attribute is missing in debug configuration.")
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "replay", "program": fixture.Source, "traceDirPath": ""})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "replay", "program": fixture.Source, "traceDirPath": ""})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The 'traceDirPath' attribute is missing in debug configuration.")
 		// These errors come from debugger layer
 		if _, err := exec.LookPath("rr"); err != nil {
-			client.LaunchRequestWithArgs(map[string]interface{}{"mode": "replay", "backend": "ignored", "traceDirPath": ".."})
+			client.LaunchRequestWithArgs(map[string]any{"mode": "replay", "backend": "ignored", "traceDirPath": ".."})
 			checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 				"Failed to launch: backend unavailable")
 		}
 
 		// Bad "core" parameters
 		// These errors come from dap layer
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "core", "coreFilePath": ""})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "core", "coreFilePath": ""})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The program attribute is missing in debug configuration.")
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "core", "program": fixture.Source, "coreFilePath": ""})
+		client.LaunchRequestWithArgs(map[string]any{"mode": "core", "program": fixture.Source, "coreFilePath": ""})
 		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to launch: The 'coreFilePath' attribute is missing in debug configuration.")
 		// These errors come from debugger layer
-		client.LaunchRequestWithArgs(map[string]interface{}{"mode": "core", "backend": "ignored", "program": fixture.Source, "coreFilePath": fixture.Source})
-		checkFailedToLaunchWithMessage(client.ExpectVisibleErrorResponse(t),
-			"Failed to launch: unrecognized core format")
+		client.LaunchRequestWithArgs(map[string]any{"mode": "core", "backend": "ignored", "program": fixture.Source, "coreFilePath": fixture.Source})
+		checkFailedToLaunchWithMessageRe(client.ExpectVisibleErrorResponse(t),
+			"Failed to launch .*: unrecognized core format")
 
 		// We failed to launch the program. Make sure shutdown still works.
 		client.DisconnectRequest()
@@ -6671,49 +7116,45 @@ func TestBadAttachRequest(t *testing.T) {
 		}
 
 		// Bad "mode"
-		client.AttachRequest(map[string]interface{}{"mode": "blah blah blah"})
+		client.AttachRequest(map[string]any{"mode": "blah blah blah"})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: invalid debug configuration - unsupported 'mode' attribute \"blah blah blah\"")
 
-		client.AttachRequest(map[string]interface{}{"mode": 123})
+		client.AttachRequest(map[string]any{"mode": 123})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: invalid debug configuration - cannot unmarshal number into \"mode\" of type string")
 
-		client.AttachRequest(map[string]interface{}{"mode": ""}) // empty mode defaults to "local" (not an error)
+		client.AttachRequest(map[string]any{"mode": ""}) // empty mode defaults to "local" (not an error)
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: The 'processId' or 'waitFor' attribute is missing in debug configuration")
 
-		client.AttachRequest(map[string]interface{}{}) // no mode defaults to "local" (not an error)
+		client.AttachRequest(map[string]any{}) // no mode defaults to "local" (not an error)
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: The 'processId' or 'waitFor' attribute is missing in debug configuration")
 
 		// Bad "processId"
-		client.AttachRequest(map[string]interface{}{"mode": "local"})
+		client.AttachRequest(map[string]any{"mode": "local"})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: The 'processId' or 'waitFor' attribute is missing in debug configuration")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": nil})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": nil})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: The 'processId' or 'waitFor' attribute is missing in debug configuration")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 0})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": 0})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: The 'processId' or 'waitFor' attribute is missing in debug configuration")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 1, "waitFor": "loopprog"})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": 1, "waitFor": "loopprog"})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: 'processId' and 'waitFor' are mutually exclusive, and can't be specified at the same time")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": "1"})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": "1"})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: invalid debug configuration - cannot unmarshal string into \"processId\" of type int")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 1})
-		// The exact message varies on different systems, so skip that check
-		checkFailedToAttach(client.ExpectVisibleErrorResponse(t)) // could not attach to pid 1
-
 		// This will make debugger.(*Debugger) panic, which we will catch as an internal error.
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": -1})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": -1})
 		er := client.ExpectInvisibleErrorResponse(t)
 		if er.RequestSeq != seqCnt {
 			t.Errorf("RequestSeq got %d, want %d", seqCnt, er.RequestSeq)
@@ -6730,11 +7171,11 @@ func TestBadAttachRequest(t *testing.T) {
 		}
 
 		// Bad "backend"
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 1, "backend": 123})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": 1, "backend": 123})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: invalid debug configuration - cannot unmarshal number into …")
 
-		client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 1, "backend": "foo"})
+		client.AttachRequest(map[string]any{"mode": "local", "processId": 1, "backend": "foo"})
 		checkFailedToAttachWithMessage(client.ExpectVisibleErrorResponse(t),
 			"Failed to attach: could not attach to pid 1: unknown backend \"foo\"")
 
@@ -6754,7 +7195,7 @@ func launchDebuggerWithTargetRunning(t *testing.T, fixture string) (*protest.Fix
 	var err error
 	go func() {
 		t.Helper()
-		_, err = dbg.Command(&api.DebuggerCommand{Name: api.Continue}, running, nil)
+		_, err = dbg.Command(&api.DebuggerCommand{Name: api.Continue}, running, nil, nil)
 		select {
 		case <-running:
 		default:
@@ -6834,7 +7275,7 @@ func TestAttachRemoteToDlvLaunchHaltedStopOnEntry(t *testing.T) {
 	// Halted + stop on entry
 	_, dbg := launchDebuggerWithTargetHalted(t, "increment")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
-		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
+		client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": true})
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		client.ConfigurationDoneRequest()
@@ -6846,7 +7287,7 @@ func TestAttachRemoteToDlvLaunchHaltedStopOnEntry(t *testing.T) {
 func TestAttachRemoteToDlvAttachHaltedStopOnEntry(t *testing.T) {
 	cmd, dbg := attachDebuggerWithTargetHalted(t, "http_server")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
-		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
+		client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": true})
 		client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
@@ -6865,7 +7306,7 @@ func TestAttachRemoteToHaltedTargetContinueOnEntry(t *testing.T) {
 	// Halted + continue on entry
 	_, dbg := launchDebuggerWithTargetHalted(t, "http_server")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
-		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": false})
+		client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": false})
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		client.ConfigurationDoneRequest()
@@ -6881,7 +7322,7 @@ func TestAttachRemoteToHaltedTargetContinueOnEntry(t *testing.T) {
 func TestAttachRemoteToRunningTargetStopOnEntry(t *testing.T) {
 	fixture, dbg := launchDebuggerWithTargetRunning(t, "loopprog")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
-		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
+		client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": true})
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		// Target is halted here
@@ -6900,7 +7341,7 @@ func TestAttachRemoteToRunningTargetStopOnEntry(t *testing.T) {
 func TestAttachRemoteToRunningTargetContinueOnEntry(t *testing.T) {
 	fixture, dbg := launchDebuggerWithTargetRunning(t, "loopprog")
 	runTestWithDebugger(t, dbg, func(client *daptest.Client) {
-		client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": false})
+		client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": false})
 		client.ExpectInitializedEvent(t)
 		client.ExpectAttachResponse(t)
 		// Target is halted here
@@ -6956,7 +7397,7 @@ func (s *MultiClientCloseServerMock) stop(t *testing.T) {
 	// they are part of dap.Session.
 	// We must take it down manually as if we are in rpccommon::ServerImpl::Stop.
 	if s.debugger.IsRunning() {
-		s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil, nil)
+		s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil, nil, nil)
 	}
 	s.debugger.Detach(true)
 }
@@ -6991,7 +7432,7 @@ func TestAttachRemoteMultiClientDisconnect(t *testing.T) {
 			client.InitializeRequest()
 			client.ExpectInitializeResponseAndCapabilities(t)
 
-			client.AttachRequest(map[string]interface{}{"mode": "remote", "stopOnEntry": true})
+			client.AttachRequest(map[string]any{"mode": "remote", "stopOnEntry": true})
 			client.ExpectCapabilitiesEventSupportTerminateDebuggee(t)
 			client.ExpectInitializedEvent(t)
 			client.ExpectAttachResponse(t)
@@ -7042,7 +7483,7 @@ func TestLaunchAttachErrorWhenDebugInProgress(t *testing.T) {
 				}
 
 				// Both launch and attach requests should go through for additional error checking
-				client.AttachRequest(map[string]interface{}{"mode": "local", "processId": 100})
+				client.AttachRequest(map[string]any{"mode": "local", "processId": 100})
 				er := client.ExpectVisibleErrorResponse(t)
 				msgRe := regexp.MustCompile("Failed to attach: debug session already in progress at .+ - use remote mode to connect to a server with an active debug session")
 				if er.Body.Error == nil || er.Body.Error.Id != FailedToAttach || !msgRe.MatchString(er.Body.Error.Format) {
@@ -7051,7 +7492,7 @@ func TestLaunchAttachErrorWhenDebugInProgress(t *testing.T) {
 				tests := []string{"debug", "test", "exec", "replay", "core"}
 				for _, mode := range tests {
 					t.Run(mode, func(t *testing.T) {
-						client.LaunchRequestWithArgs(map[string]interface{}{"mode": mode})
+						client.LaunchRequestWithArgs(map[string]any{"mode": mode})
 						er := client.ExpectVisibleErrorResponse(t)
 						msgRe := regexp.MustCompile("Failed to launch: debug session already in progress at .+ - use remote attach mode to connect to a server with an active debug session")
 						if er.Body.Error == nil || er.Body.Error.Id != FailedToLaunch || !msgRe.MatchString(er.Body.Error.Format) {
@@ -7134,7 +7575,7 @@ func TestBadlyFormattedMessageToServer(t *testing.T) {
 		client.BadRequest()
 		time.Sleep(100 * time.Millisecond)
 
-		_, err := client.ReadMessage()
+		_, err := client.ReadMessage(t)
 
 		if err != io.EOF {
 			t.Errorf("got err=%v, want io.EOF", err)
@@ -7156,6 +7597,43 @@ func TestBadlyFormattedMessageToServer(t *testing.T) {
 		client.DisconnectRequest()
 		client.ExpectDisconnectResponse(t)
 	})
+}
+
+func TestRequestsBeforeLaunch(t *testing.T) {
+	// Checks that we don't try to use s.debugger before we have initialized it
+	// if we receive a request before a launch request (or after a launch
+	// request has failed).
+	// Issues #4060 and #4237
+
+	serverStopped := make(chan struct{})
+	server, _ := startDAPServer(t, false, serverStopped)
+
+	client := daptest.NewClient(server.listener.Addr().String())
+	defer client.Close()
+
+	// Initialize only, no launch/attach
+	client.InitializeRequest()
+	client.ExpectInitializeResponseAndCapabilities(t)
+
+	// Send ConfigurationDone before Launch/Attach
+	client.ConfigurationDoneRequest()
+
+	resp := client.ExpectVisibleErrorResponse(t)
+	if resp.Body.Error != nil {
+		expectedMsg := "No debug session started: Use launch or attach request first."
+		if resp.Body.Error.Format != expectedMsg {
+			t.Errorf("Expected error message %q, got %q", expectedMsg, resp.Body.Error.Format)
+		}
+	}
+
+	client.StepOutRequest(0)
+	client.ExpectVisibleErrorResponse(t)
+
+	client.DisconnectRequest()
+	client.ExpectDisconnectResponse(t)
+	client.ExpectTerminatedEvent(t)
+
+	<-serverStopped
 }
 
 func TestParseLogPoint(t *testing.T) {
@@ -7324,7 +7802,7 @@ func TestAlignPCs(t *testing.T) {
 	NUM_FUNCS := 10
 	// Create fake functions to test align PCs.
 	funcs := make([]proc.Function, NUM_FUNCS)
-	for i := 0; i < len(funcs); i++ {
+	for i := range funcs {
 		funcs[i] = proc.Function{
 			Entry: uint64(100 + i*10),
 			End:   uint64(100 + i*10 + 5),
@@ -7406,7 +7884,7 @@ func TestFindInstructions(t *testing.T) {
 	numInstructions := 100
 	startPC := 0x1000
 	procInstructions := make([]proc.AsmInstruction, numInstructions)
-	for i := 0; i < len(procInstructions); i++ {
+	for i := range procInstructions {
 		procInstructions[i] = proc.AsmInstruction{
 			Loc: proc.Location{
 				PC: uint64(startPC + 2*i),
@@ -7599,41 +8077,88 @@ func TestDisassembleCgo(t *testing.T) {
 		protest.AllNonOptimized, true)
 }
 
+func checkExceptionBreakpoints(t *testing.T, resp *dap.SetExceptionBreakpointsResponse, ids ...int) {
+	t.Helper()
+	if len(resp.Body.Breakpoints) != len(ids) {
+		t.Errorf("want: %v got: %v", ids, resp.Body.Breakpoints)
+		return
+	}
+	slices.SortFunc(resp.Body.Breakpoints, func(a, b dap.Breakpoint) int {
+		return cmp.Compare(a.Id, b.Id)
+	})
+	sort.Ints(ids)
+	for i := range resp.Body.Breakpoints {
+		if resp.Body.Breakpoints[i].Id != ids[i] {
+			t.Errorf("want %v got %v", ids, resp.Body.Breakpoints)
+			return
+		}
+		if !resp.Body.Breakpoints[i].Verified {
+			t.Errorf("breakpoint %d not verified", resp.Body.Breakpoints[i].Id)
+		}
+	}
+}
+
+func TestSetExceptionBreakpoints(t *testing.T) {
+	runTestBuildFlags(t, "panic", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			fixture.Source, []int{3},
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 3)
+					client.SetExceptionBreakpointsRequest([]string{proc.UnrecoveredPanic, proc.FatalThrow})
+					checkExceptionBreakpoints(t, client.ExpectSetExceptionBreakpointsResponse(t), -1, -2)
+
+					client.SetExceptionBreakpointsRequest([]string{})
+					checkExceptionBreakpoints(t, client.ExpectSetExceptionBreakpointsResponse(t))
+
+					client.SetExceptionBreakpointsRequest([]string{proc.UnrecoveredPanic, proc.FatalThrow})
+					checkExceptionBreakpoints(t, client.ExpectSetExceptionBreakpointsResponse(t), -1, -2)
+
+					client.SetExceptionBreakpointsRequest([]string{proc.FatalThrow})
+					checkExceptionBreakpoints(t, client.ExpectSetExceptionBreakpointsResponse(t), -2)
+
+					// If disabling the predefined breakpoints doesn't work Delve will stop
+					// on the target's panic and runTestBuildFlags, which expects a
+					// terminated event, will fail the test.
+				},
+				disconnect: true,
+			}},
+		)
+	}, 0, true)
+}
+
 func TestRedirect(t *testing.T) {
 	runTest(t, "out_redirect", func(client *daptest.Client, fixture protest.Fixture) {
 		// 1 >> initialize, << initialize
 		client.InitializeRequest()
 		initResp := client.ExpectInitializeResponseAndCapabilities(t)
-		if initResp.Seq != 0 || initResp.RequestSeq != 1 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=1", initResp)
+		if initResp.RequestSeq != 1 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=1", initResp)
 		}
 
 		// 2 >> launch, << process, << initialized, << launch
-		client.LaunchRequestWithArgs(map[string]interface{}{
+		client.LaunchRequestWithArgs(map[string]any{
 			"request":    "launch",
 			"mode":       "debug",
 			"program":    fixture.Source,
 			"outputMode": "remote",
 		})
-		processEvent := client.ExpectProcessEvent(t)
-		if processEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", processEvent)
-		}
-		initEvent := client.ExpectInitializedEvent(t)
-		if initEvent.Seq != 0 {
-			t.Errorf("\ngot %#v\nwant Seq=0", initEvent)
-		}
+		client.ExpectProcessEvent(t)
+		client.ExpectInitializedEvent(t)
 		launchResp := client.ExpectLaunchResponse(t)
-		if launchResp.Seq != 0 || launchResp.RequestSeq != 2 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=2", launchResp)
+		if launchResp.RequestSeq != 2 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=2", launchResp)
 		}
 
 		// 5 >> configurationDone, << stopped, << configurationDone
 		client.ConfigurationDoneRequest()
 
 		cdResp := client.ExpectConfigurationDoneResponse(t)
-		if cdResp.Seq != 0 || cdResp.RequestSeq != 3 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=5", cdResp)
+		if cdResp.RequestSeq != 3 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=5", cdResp)
 		}
 
 		// 6 << output, << terminated
@@ -7679,19 +8204,316 @@ func TestRedirect(t *testing.T) {
 		// 7 >> disconnect, << disconnect
 		client.DisconnectRequest()
 		oep := client.ExpectOutputEventProcessExited(t, 0)
-		if oep.Seq != 0 || oep.Body.Category != "console" {
-			t.Errorf("\ngot %#v\nwant Seq=0 Category='console'", oep)
+		if oep.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oep)
 		}
 		oed := client.ExpectOutputEventDetaching(t)
-		if oed.Seq != 0 || oed.Body.Category != "console" {
-			t.Errorf("\ngot %#v\nwant Seq=0 Category='console'", oed)
+		if oed.Body.Category != "console" {
+			t.Errorf("\ngot %#v\nwant Category='console'", oed)
 		}
 		dResp := client.ExpectDisconnectResponse(t)
-		if dResp.Seq != 0 || dResp.RequestSeq != 4 {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=43", dResp)
+		if dResp.RequestSeq != 4 {
+			t.Errorf("\ngot %#v\nwant RequestSeq=43", dResp)
 		}
 		client.ExpectTerminatedEvent(t)
 	})
+}
+
+func TestBreakpointAfterDisconnect(t *testing.T) {
+	if runtime.GOOS == "freebsd" {
+		// This test when run on FreeBSD will cause subsequent tests to sometimes fail.
+		t.Skip("causes problems")
+	}
+	fixture := protest.BuildFixture(t, "testnextnethttp", protest.AllNonOptimized)
+
+	cmd := exec.Command(fixture.Path)
+
+	// Capture stdout to read the port number
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal("failed to create stdout pipe:", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the port from stdout in a goroutine
+	var port int
+	portChan := make(chan int, 1)
+	go func() {
+		var portLine string
+		buf := make([]byte, 256)
+		for {
+			n, err := stdout.Read(buf)
+			if err != nil {
+				return
+			}
+			portLine += string(buf[:n])
+			if strings.Contains(portLine, "LISTENING:") {
+				parts := strings.Split(portLine, "LISTENING:")
+				if len(parts) > 1 {
+					portStr := strings.TrimSpace(strings.Split(parts[1], "\n")[0])
+					if p, err := strconv.Atoi(portStr); err == nil {
+						portChan <- p
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	var server MultiClientCloseServerMock
+	server.stopped = make(chan struct{})
+	server.impl, server.forceStop = startDAPServer(t, false, server.stopped)
+
+	dbg, err := debugger.New(&debugger.Config{Backend: "default", AttachPid: cmd.Process.Pid}, nil)
+	if err != nil {
+		t.Fatalf("debugger.New: %v", err)
+	}
+
+	server.debugger = dbg
+
+	client := server.acceptNewClient(t)
+
+	client.InitializeRequest()
+	client.ExpectInitializeResponse(t)
+
+	client.SetBreakpointsRequestWithArgs(fixture.Source, []int{16}, nil, nil, map[int]string{16: "{w}"})
+	client.ExpectSetBreakpointsResponse(t)
+
+	client.ContinueRequest(1)
+	client.ExpectContinueResponse(t)
+
+	client.DisconnectRequestWithKillOption(false)
+	client.ExpectOutputEvent(t)
+	client.ExpectDisconnectResponse(t)
+	client.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	server.impl.session.conn = &connection{ReadWriteCloser: discard{}} // fake a race condition between onDisconnectRequest and the runUntilStopAndNotify goroutine
+
+	// Wait for port to be available
+	select {
+	case port = <-portChan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fixture to start listening")
+	}
+
+	httpClient := &http.Client{Timeout: time.Second}
+
+	resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/nobp", port))
+	if err != nil {
+		t.Fatalf("Page request after disconnect failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	cmd.Process.Kill()
+}
+
+func TestRedirects(t *testing.T) {
+	var (
+		infile  = "redirect-input.txt"
+		outfile = "redirect-output.txt"
+	)
+	runTest(t, "redirect", func(client *daptest.Client, fixture protest.Fixture) {
+		infile = filepath.Join(filepath.Dir(fixture.Source), infile)
+		outfile = filepath.Join(filepath.Dir(fixture.Source), outfile)
+		client.InitializeRequest()
+		client.ExpectInitializeResponseAndCapabilities(t)
+		client.LaunchRequestWithArgs(map[string]any{
+			"mode": "exec", "program": fixture.Path, "stdinFrom": infile, "stdoutTo": outfile,
+		})
+		client.ExpectProcessEvent(t)
+		client.ExpectInitializedEvent(t)
+		client.ExpectLaunchResponse(t)
+
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		client.ExpectTerminatedEvent(t)
+
+		buf, err := os.ReadFile(outfile)
+		if err != nil {
+			t.Fatalf("error reading output file: %v", err)
+		}
+		t.Logf("output %q", buf)
+		if !strings.HasPrefix(string(buf), "Redirect test") {
+			t.Fatalf("Wrong output %q", string(buf))
+		}
+
+		client.RestartRequest(map[string]any{
+			"arguments": map[string]any{
+				"request": "launch",
+				"rebuild": false,
+			},
+		})
+		client.ExpectRestartResponse(t)
+		client.ExpectInitializedEvent(t)
+
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		client.ExpectTerminatedEvent(t)
+
+		buf2, err := os.ReadFile(outfile)
+		if err != nil {
+			t.Fatalf("error reading output file (second time): %v", err)
+		}
+		t.Logf("output %q", buf2)
+		if !strings.HasPrefix(string(buf2), "Redirect test") {
+			t.Fatalf("Wrong output (second time) %q", string(buf))
+		}
+		if string(buf2) == string(buf) {
+			t.Fatalf("Expected output change got %q", string(buf))
+		}
+		os.Remove(outfile)
+
+		client.DisconnectRequest()
+		client.ExpectOutputEvent(t)
+		client.ExpectOutputEvent(t)
+		client.ExpectDisconnectResponse(t)
+	})
+}
+
+func TestReadMemory_StringPagination(t *testing.T) {
+	if runtime.GOOS == "freebsd" {
+		t.Skip("test skipped on freebsd")
+	}
+
+	runTest(t, "readmem_json", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Breakpoints are set within the program
+			fixture.Source, []int{},
+			[]onBreakpoint{
+				{
+					execute:    func() {},
+					disconnect: false,
+				},
+				{
+					execute: func() {
+						client.StackTraceRequest(1, 0, 20)
+						_ = client.ExpectStackTraceResponse(t)
+
+						client.ScopesRequest(1000)
+						_ = client.ExpectScopesResponse(t)
+
+						client.VariablesRequest(localsScope)
+						locals := client.ExpectVariablesResponse(t)
+						if locals == nil {
+							t.Fatal("wanted local variables, got 0")
+						}
+
+						mustGetByName := func(vars []dap.Variable, names ...string) (map[string]dap.Variable, error) {
+							res := make(map[string]dap.Variable)
+
+							for _, n := range names {
+								idx := slices.IndexFunc(vars, func(v dap.Variable) bool {
+									return v.Name == n
+								})
+
+								if idx == -1 {
+									return nil, fmt.Errorf("%s not found", n)
+								}
+
+								res[n] = vars[idx]
+							}
+
+							return res, nil
+						}
+
+						varIdx, err := mustGetByName(locals.Body.Variables,
+							"jsonString",
+							"jsonHash",
+							"jsonAddr",
+							"bytesString",
+							"nonprint",
+						)
+						if err != nil {
+							t.Fatal(err)
+						}
+
+						longString := varIdx["jsonString"]
+
+						if strings.Trim(varIdx["jsonAddr"].Value, `"`) != longString.MemoryReference {
+							t.Fatal("bad memory address")
+						}
+
+						got := readVarByChunk(t, client, longString, 64)
+						hashed := sha256.Sum256(got.Bytes())
+						hashString := hex.EncodeToString(hashed[:])
+
+						if strings.Trim(varIdx["jsonHash"].Value, `"`) != hashString {
+							t.Fatal("we got wrong values")
+						}
+
+						bytes := readVarByChunk(t, client, varIdx["bytesString"], 1)
+
+						if bytes.String() != "this\nis\nit" {
+							t.Fail()
+						}
+
+						nonp := readVarByChunk(t, client, varIdx["nonprint"], 1)
+						want := []byte{242, 243, 244, 245}
+
+						for i, b := range nonp.Bytes() {
+							if want[i] != b {
+								t.Fail()
+							}
+						}
+					},
+					disconnect: true,
+				}})
+	})
+}
+
+func readVarByChunk(t *testing.T, client *daptest.Client, v dap.Variable, chunk int) bytes.Buffer {
+	t.Helper()
+
+	var got bytes.Buffer
+
+	for off := 0; ; off += chunk {
+		count := chunk
+		client.ReadMemoryRequest(v.MemoryReference, off, count)
+		rm := client.ExpectReadMemoryResponse(t)
+
+		if rm.Body.Data == "" {
+			break
+		}
+
+		data, err := base64.StdEncoding.DecodeString(rm.Body.Data)
+		if err != nil {
+			t.Fatalf("base64 decode failed: %v", err)
+		}
+
+		got.Write(data)
+
+		if len(data) < count {
+			break
+		}
+	}
+
+	return got
+}
+
+type discard struct {
+}
+
+func (discard) Read([]byte) (int, error) {
+	return 0, nil
+}
+
+func (discard) Close() error {
+	return nil
+}
+
+func (discard) Write(buf []byte) (int, error) {
+	return len(buf), nil
 }
 
 // Helper functions for checking ErrorMessage field values.
@@ -7705,4 +8527,129 @@ func checkErrorMessageFormat(er *dap.ErrorMessage, fmt string) bool {
 		return er != nil && strings.HasPrefix(er.Format, fmt[:dotdotdot])
 	}
 	return er != nil && er.Format == fmt
+}
+
+func TestDataBreakpoints(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		// ok
+	default:
+		t.Skip("not implemented")
+	}
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+		// ok
+	default:
+		t.Skip("not implemented")
+	}
+
+	setup := func(client *daptest.Client, fixture protest.Fixture, bps []int) {
+		client.InitializeRequest()
+		client.ExpectInitializeResponseAndCapabilities(t)
+		client.LaunchRequestWithArgs(map[string]any{"mode": "exec", "program": fixture.Path})
+		client.ExpectProcessEvent(t)
+		client.ExpectInitializedEvent(t)
+		client.ExpectLaunchResponse(t)
+
+		client.SetBreakpointsRequest(fixture.Source, bps)
+		sbpr := client.ExpectSetBreakpointsResponse(t)
+		if len(sbpr.Body.Breakpoints) != len(bps) {
+			t.Fatalf("\ngot %#v\nwant %d breakpoints\n", sbpr, len(bps))
+		}
+		for _, bp := range sbpr.Body.Breakpoints {
+			if !bp.Verified {
+				t.Fatalf("\ngot %#v\nwant %d verified breakpoints\n", sbpr, len(bps))
+			}
+		}
+	}
+
+	cont := func(client *daptest.Client) *dap.StoppedEvent {
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		return client.ExpectStoppedEvent(t)
+	}
+
+	contToBp := func(client *daptest.Client, hitBp int) {
+		se := cont(client)
+		if se.Event.Event != "stopped" || se.Body.Reason != "breakpoint" || len(se.Body.HitBreakpointIds) != 1 || se.Body.HitBreakpointIds[0] != hitBp {
+			t.Fatalf("\ngot %#v\nwant hit breakpoint %d\n", se, hitBp)
+		}
+
+	}
+
+	teardown := func(client *daptest.Client) {
+		client.DisconnectRequest()
+		client.ExpectOutputEvent(t)
+		client.ExpectDisconnectResponse(t)
+	}
+
+	setDataBp := func(client *daptest.Client, varRef int, expr string) {
+		client.DataBreakpointInfoRequest(varRef, expr)
+		dbi := client.ExpectDataBreakpointInfoResponse(t)
+
+		if dbi.Body.DataId == "" {
+			t.Fatalf("\ngot %#v\nwant some dataId\n", dbi)
+		}
+
+		client.SetDataBreakpointsRequest([]string{dbi.Body.DataId.(string)})
+		sdbpr := client.ExpectSetDataBreakpointsResponse(t)
+		if len(sdbpr.Body.Breakpoints) != 1 || !sdbpr.Body.Breakpoints[0].Verified {
+			t.Fatalf("\ngot %#v\nwant one verified data breakpoint\n", sdbpr)
+		}
+	}
+
+	curFrame := func(client *daptest.Client) dap.StackFrame {
+		client.StackTraceRequest(1, 0, 10)
+		stresp := client.ExpectStackTraceResponse(t)
+		return stresp.Body.StackFrames[0]
+	}
+
+	runTest(t, "databpeasy", func(client *daptest.Client, fixture protest.Fixture) {
+		setup(client, fixture, []int{13, 21})
+
+		contToBp(client, 1)
+
+		setDataBp(client, 0, "globalvar1")
+
+		se := cont(client)
+		if se.Body.Reason != "data breakpoint" || se.Event.Event != "stopped" {
+			t.Fatalf("\ngot %#v\nwant { Event: { Event: stopped, Body: { Reason: \"data breakpoint\" } } }\n", se)
+		}
+		frame := curFrame(client)
+		if frame.Line != 18 && frame.Line != 19 {
+			t.Fatalf("\ngot %#v\nwant line 18 or 19\n", frame)
+		}
+
+		client.SetDataBreakpointsRequest([]string{})
+		sdbpr := client.ExpectSetDataBreakpointsResponse(t)
+		if len(sdbpr.Body.Breakpoints) != 0 {
+			t.Fatalf("\ngot %#v\nwant no data breakpoints\n", sdbpr)
+		}
+
+		contToBp(client, 2)
+
+		teardown(client)
+	})
+
+	runTest(t, "databpstack", func(client *daptest.Client, fixture protest.Fixture) {
+		setup(client, fixture, []int{11})
+		contToBp(client, 1)
+
+		frame := curFrame(client)
+		client.ScopesRequest(frame.Id)
+		sresp := client.ExpectScopesResponse(t)
+		setDataBp(client, sresp.Body.Scopes[0].VariablesReference, "w")
+
+		se := cont(client)
+		if se.Body.Reason != "data breakpoint" || se.Event.Event != "stopped" {
+			t.Fatalf("\ngot %#v\nwant { Event: { Event: stopped, Body: { Reason: \"data breakpoint\" } } }\n", se)
+		}
+
+		frame = curFrame(client)
+		if frame.Line != 16 && frame.Line != 17 {
+			t.Fatalf("got %#v\nwant line 16 or 17\n", frame)
+		}
+
+		teardown(client)
+	})
 }

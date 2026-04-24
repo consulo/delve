@@ -19,10 +19,12 @@ func assertExprResult(t *testing.T, expected int64, instructions []byte) {
 }
 
 func TestExecuteStackProgram(t *testing.T) {
+	t.Parallel()
 	assertExprResult(t, 56, []byte{byte(DW_OP_consts), 0x1c, byte(DW_OP_consts), 0x1c, byte(DW_OP_plus)})
 }
 
 func TestSignExtension(t *testing.T) {
+	t.Parallel()
 	var tgt uint64 = 0xffffffffffffff88
 	assertExprResult(t, int64(tgt), []byte{byte(DW_OP_const1s), 0x88})
 	tgt = 0xffffffffffff8888
@@ -30,12 +32,34 @@ func TestSignExtension(t *testing.T) {
 }
 
 func TestStackOps(t *testing.T) {
+	t.Parallel()
 	assertExprResult(t, 1, []byte{byte(DW_OP_lit1), byte(DW_OP_lit2), byte(DW_OP_drop)})
 	assertExprResult(t, 0, []byte{byte(DW_OP_lit1), byte(DW_OP_lit0), byte(DW_OP_pick), 0})
 	assertExprResult(t, 1, []byte{byte(DW_OP_lit1), byte(DW_OP_lit0), byte(DW_OP_pick), 1})
 }
 
+// DW_OP_shr is a logical shift (zero-fill); DW_OP_shra is arithmetic (sign-extend).
+// For a negative value being shifted, the two opcodes must disagree.
+func TestBinaryOp_ShrVsShra_NegativeShiftedValue(t *testing.T) {
+	t.Parallel()
+	second := int64(-8)
+	shift := uint64(1)
+	wantShr := int64(uint64(second) >> shift)
+	wantShra := second >> shift
+	assertExprResult(t, wantShr, []byte{
+		byte(DW_OP_const1s), 0xf8, // -8
+		byte(DW_OP_lit1),
+		byte(DW_OP_shr),
+	})
+	assertExprResult(t, wantShra, []byte{
+		byte(DW_OP_const1s), 0xf8,
+		byte(DW_OP_lit1),
+		byte(DW_OP_shra),
+	})
+}
+
 func TestBra(t *testing.T) {
+	t.Parallel()
 	assertExprResult(t, 32, []byte{
 		byte(DW_OP_lit1),
 		byte(DW_OP_lit5),

@@ -25,7 +25,7 @@ cancel_next() | Equivalent to API call [CancelNext](https://pkg.go.dev/github.co
 checkpoint(Where) | Equivalent to API call [Checkpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Checkpoint)
 clear_breakpoint(Id, Name) | Equivalent to API call [ClearBreakpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.ClearBreakpoint)
 clear_checkpoint(ID) | Equivalent to API call [ClearCheckpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.ClearCheckpoint)
-raw_command(Name, ThreadID, GoroutineID, ReturnInfoLoadConfig, Expr, UnsafeCall) | Equivalent to API call [Command](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Command)
+raw_command(Name, ThreadID, GoroutineID, ReturnInfoLoadConfig, Expr, WithEvents, UnsafeCall) | Equivalent to API call [Command](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Command)
 create_breakpoint(Breakpoint, LocExpr, SubstitutePathRules, Suspended) | Equivalent to API call [CreateBreakpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.CreateBreakpoint)
 create_ebpf_tracepoint(FunctionName) | Equivalent to API call [CreateEBPFTracepoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.CreateEBPFTracepoint)
 create_watchpoint(Scope, Expr, Type) | Equivalent to API call [CreateWatchpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.CreateWatchpoint)
@@ -65,9 +65,10 @@ process_pid() | Equivalent to API call [ProcessPid](https://pkg.go.dev/github.co
 recorded() | Equivalent to API call [Recorded](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Recorded)
 restart(Position, ResetArgs, NewArgs, Rerecord, Rebuild, NewRedirects) | Equivalent to API call [Restart](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Restart)
 set_expr(Scope, Symbol, Value) | Equivalent to API call [Set](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Set)
-stacktrace(Id, Depth, Full, Defers, Opts, Cfg) | Equivalent to API call [Stacktrace](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Stacktrace)
+stacktrace(Id, Depth, Full, Defers, Opts, Cfg, Skip) | Equivalent to API call [Stacktrace](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.Stacktrace)
 state(NonBlocking) | Equivalent to API call [State](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.State)
 toggle_breakpoint(Id, Name) | Equivalent to API call [ToggleBreakpoint](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.ToggleBreakpoint)
+type_info(Name) | Equivalent to API call [TypeInfo](https://pkg.go.dev/github.com/go-delve/delve/service/rpc2#RPCServer.TypeInfo)
 dlv_command(command) | Executes the specified command as if typed at the dlv_prompt
 read_file(path) | Reads the file as a string
 write_file(path, contents) | Writes string to a file
@@ -98,9 +99,28 @@ Otherwise arguments passed on the command line are interpreted as starlark expre
 
 If the command function has a doc string it will be used as a help message.
 
+## Using custom commands with the `on` prefix
+
+All custom starlark commands can be used with the `on` command (see `help on`) to execute when a breakpoint is hit:
+
+```python
+def command_my_trace(args):
+	"""Custom trace command that executes when a breakpoint is hit."""
+	print("Tracing:", args)
+```
+
+You can use this command like this:
+
+```
+(dlv) break main.go:10
+(dlv) on 1 my_trace
+```
+
 # Working with variables
 
 Variables of the target program can be accessed using `local_vars`, `function_args` or the `eval` functions. Each variable will be returned as a [Variable](https://pkg.go.dev/github.com/go-delve/delve/service/api#Variable) struct, with one special field: `Value`.
+
+As a convenience a special global object exists, called `tgt`: evaluating `tgt.varname` is equivalent to evaluating `eval(None, "varname").Variable.Value`.
 
 ## Variable.Value
 

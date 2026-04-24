@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/gobuild"
 	"github.com/go-delve/delve/pkg/goversion"
@@ -138,8 +139,9 @@ type Config struct {
 	// Packages contains the packages that we are debugging.
 	Packages []string
 
-	// BuildFlags contains the flags passed to the compiler.
-	BuildFlags string
+	// BuildFlags contains the flags passed to the compiler, it can either be a
+	// string, which will be processed by config.SplitQuotedFields or a []string
+	BuildFlags any
 
 	// ExecuteKind contains the kind of the executed program.
 	ExecuteKind ExecuteKind
@@ -157,6 +159,7 @@ type Config struct {
 	DisableASLR bool
 
 	RrOnProcessPid int
+	RrDelOnDetach  bool
 }
 
 // New creates a new Debugger. ProcessArgs specify the commandline arguments for the
@@ -192,13 +195,14 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 			err = noDebugErrorWarning(err)
 			return nil, attachErrorMessage(d.config.AttachPid, err)
 		}
+		d.config.AttachPid = d.target.Selected.Pid()
 
 	case d.config.CoreFile != "":
 		var err error
 		switch d.config.Backend {
 		case "rr":
 			d.log.Infof("opening trace %s", d.config.CoreFile)
-			d.target, err = gdbserial.Replay(d.config.CoreFile, false, false, d.config.DebugInfoDirectories, d.config.RrOnProcessPid, "")
+			d.target, err = gdbserial.Replay(d.config.CoreFile, false, d.config.RrDelOnDetach, d.config.DebugInfoDirectories, d.config.RrOnProcessPid, "")
 		default:
 			d.log.Infof("opening core file %s (executable %s)", d.config.CoreFile, d.processArgs[0])
 			d.target, err = core.OpenCore(d.config.CoreFile, d.processArgs[0], d.config.DebugInfoDirectories)
@@ -358,7 +362,7 @@ func (d *Debugger) recordingRun(run func() (string, error)) (*proc.TargetGroup, 
 		return nil, err
 	}
 
-	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories, 0, strings.Join(d.processArgs, " "))
+	return gdbserial.Replay(tracedir, false, d.config.RrDelOnDetach, d.config.DebugInfoDirectories, 0, strings.Join(d.processArgs, " "))
 }
 
 // Attach will attach to the process specified by 'pid'.
@@ -407,13 +411,10 @@ func (d *Debugger) LastModified() time.Time {
 	return d.target.Selected.BinInfo().LastModified()
 }
 
-// FunctionReturnLocations returns all return locations
-// for the given function, a list of addresses corresponding
-// to 'ret' or 'call runtime.deferreturn'.
-func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
-	d.targetMutex.Lock()
-	defer d.targetMutex.Unlock()
-
+// functionReturnLocationsInternal is same as FunctionReturnLocations
+// except that it does not have a lock and unlock as its called from
+// within the callback which has already acquired a lock.
+func (d *Debugger) functionReturnLocationsInternal(fnName string) ([]uint64, error) {
 	if len(d.target.Targets()) > 1 {
 		return nil, ErrNotImplementedWithMultitarget
 	}
@@ -450,6 +451,15 @@ func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
 	}
 
 	return addrs, nil
+}
+
+// FunctionReturnLocations returns all return locations
+// for the given function, a list of addresses corresponding
+// to 'ret' or 'call runtime.deferreturn'.
+func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	return d.functionReturnLocationsInternal(fnName)
 }
 
 // Detach detaches from the target process.
@@ -636,6 +646,10 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig, withBreakpointInfo bool) (
 		}
 	}
 
+	if sr := d.target.Selected.StopReason; sr != proc.StopUnknown {
+		state.StopReason = sr.String()
+	}
+
 	return state, nil
 }
 
@@ -777,9 +791,9 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 	lbp.Set = setbp
 
 	if lbp.Set.Expr != nil {
-		addrs := lbp.Set.Expr(d.Target())
+		addrs := lbp.Set.Expr(d.target.Selected)
 		if len(addrs) > 0 {
-			f, l, fn := d.Target().BinInfo().PCToLine(addrs[0])
+			f, l, fn := d.target.Selected.BinInfo().PCToLine(addrs[0])
 			lbp.File = f
 			lbp.Line = l
 			if fn != nil {
@@ -898,6 +912,7 @@ func (d *Debugger) copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, reques
 	lbp.Variables = requested.Variables
 	lbp.LoadArgs = api.LoadConfigToProc(requested.LoadArgs)
 	lbp.LoadLocals = api.LoadConfigToProc(requested.LoadLocals)
+	lbp.CustomCommands = requested.CustomCommands
 	lbp.UserData = requested.UserData
 	lbp.RootFuncName = requested.RootFuncName
 	lbp.TraceFollowCalls = requested.TraceFollowCalls
@@ -909,15 +924,21 @@ func (d *Debugger) copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, reques
 func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
-	if requestedBp.ID <= 0 {
+	if requestedBp.ID == 0 {
 		if len(d.target.Targets()) != 1 {
 			return nil, ErrNotImplementedWithMultitarget
 		}
 		bp := d.target.Selected.Breakpoints().M[requestedBp.Addr]
+		if bp == nil {
+			return nil, fmt.Errorf("no breakpoint at address %#x", requestedBp.Addr)
+		}
 		requestedBp.ID = bp.LogicalID()
 	}
 
 	lbp := d.target.LogicalBreakpoints[requestedBp.ID]
+	if lbp == nil {
+		return nil, fmt.Errorf("no breakpoint with ID %d", requestedBp.ID)
+	}
 	clearedBp := d.convertBreakpoint(lbp)
 
 	err := d.target.SetBreakpointEnabled(lbp, false)
@@ -989,6 +1010,9 @@ func (d *Debugger) findBreakpointByName(name string) *api.Breakpoint {
 
 // CreateWatchpoint creates a watchpoint on the specified expression.
 func (d *Debugger) CreateWatchpoint(goid int64, frame, deferredCall int, expr string, wtype api.WatchType) (*api.Breakpoint, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+
 	p := d.target.Selected
 
 	s, err := proc.ConvertEvalScope(p, goid, frame, deferredCall)
@@ -1056,7 +1080,7 @@ func (d *Debugger) IsRunning() bool {
 }
 
 // Command handles commands which control the debugger lifecycle
-func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struct{}, clientStatusCh chan struct{}) (state *api.DebuggerState, err error) {
+func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struct{}, clientStatusCh chan struct{}, eventsFn func(*proc.Event)) (state *api.DebuggerState, err error) {
 	if command.Name == api.Halt {
 		// RequestManualStop does not invoke any ptrace syscalls, so it's safe to
 		// access the process directly.
@@ -1082,8 +1106,16 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 	d.setRunning(true)
 	defer d.setRunning(false)
 
+	d.target.SetEventsFn(nil)
 	if command.Name != api.SwitchGoroutine && command.Name != api.SwitchThread && command.Name != api.Halt {
 		d.target.ResumeNotify(resumeNotify)
+
+		if eventsFn != nil {
+			eventsFn(&proc.Event{Kind: proc.EventResumed})
+			defer eventsFn(&proc.Event{Kind: proc.EventStopped})
+		}
+
+		d.target.SetEventsFn(eventsFn)
 	} else if resumeNotify != nil {
 		close(resumeNotify)
 	}
@@ -1352,7 +1384,7 @@ func (d *Debugger) Functions(filter string, followCalls int) ([]string, error) {
 		for _, f := range t.BinInfo().Functions {
 			if regex.MatchString(f.Name) {
 				if followCalls > 0 {
-					newfuncs, err := traverse(t, &f, 1, followCalls)
+					newfuncs, err := d.traverse(t, &f, 1, followCalls, filter)
 					if err != nil {
 						return nil, fmt.Errorf("traverse failed with error %w", err)
 					}
@@ -1368,12 +1400,13 @@ func (d *Debugger) Functions(filter string, followCalls int) ([]string, error) {
 	return funcs, nil
 }
 
-func traverse(t proc.ValidTargets, f *proc.Function, depth int, followCalls int) ([]string, error) {
+func (d *Debugger) traverse(t proc.ValidTargets, f *proc.Function, depth int, followCalls int, rootstr string) ([]string, error) {
 	type TraceFunc struct {
 		Func    *proc.Function
 		Depth   int
 		visited bool
 	}
+
 	type TraceFuncptr *TraceFunc
 
 	TraceMap := make(map[string]TraceFuncptr)
@@ -1389,7 +1422,7 @@ func traverse(t proc.ValidTargets, f *proc.Function, depth int, followCalls int)
 		parent := queue[0]
 		queue = queue[1:]
 		if parent == nil {
-			panic("attempting to open file Delve cannot parse")
+			panic("queue has a nil node, cannot traverse!")
 		}
 		if parent.Depth > followCalls {
 			continue
@@ -1407,10 +1440,89 @@ func traverse(t proc.ValidTargets, f *proc.Function, depth int, followCalls int)
 		}
 		f := parent.Func
 		text, err := proc.Disassemble(t.Memory(), nil, t.Breakpoints(), t.BinInfo(), f.Entry, f.End)
+
 		if err != nil {
 			return nil, fmt.Errorf("disassemble failed with error %w", err)
 		}
 		for _, instr := range text {
+			// Dynamic functions need to be handled specially as their destination location
+			// is not known statically, hence its required to put a breakpoint in order to
+			// acquire the address of the function at runtime and we do this via a
+			// call back mechanism
+			if instr.IsCall() && instr.DestLoc == nil {
+				dynbp, err := t.SetBreakpoint(0, instr.Loc.PC, proc.NextBreakpoint, nil)
+				if err != nil {
+					return nil, fmt.Errorf("error setting breakpoint inside deferreturn")
+				}
+				dynCallback := func(th proc.Thread, tgt *proc.Target) (bool, error) {
+					// TODO(optimization): Consider using an iterator to avoid materializing
+					// the full stack when we only need frames up to the root function
+					rawlocs, err := proc.ThreadStacktrace(tgt, tgt.CurrentThread(), followCalls+2)
+					if err != nil {
+						return false, fmt.Errorf("thread stack trace returned error")
+					}
+					// Since the dynamic function is known only at runtime, the depth is likewise
+					// calculated by referring to the stack and the mechanism is similar to that
+					// used in pkg/terminal/command.go:printTraceOutput
+					rootindex := -1
+					for i := len(rawlocs) - 1; i >= 0; i-- {
+						if rawlocs[i].Call.Fn.Name == rootstr {
+							if rootindex == -1 {
+								rootindex = i
+								break
+							}
+						}
+					}
+					sdepth := rootindex + 1
+
+					if sdepth+1 > followCalls {
+						return false, nil
+					}
+					regs, err := th.Registers()
+					if err != nil {
+						return false, fmt.Errorf("registers inside callback returned err")
+
+					}
+					// Disassemble the instruction at the current PC to get the call destination
+					pc := instr.Loc.PC
+					maxInstLen := uint64(tgt.BinInfo().Arch.MaxInstructionLength())
+					disasm, err := proc.Disassemble(t.Memory(), regs, t.Breakpoints(), tgt.BinInfo(), pc, pc+maxInstLen)
+					if err != nil {
+						return false, fmt.Errorf("failed to disassemble instruction: %w", err)
+					}
+
+					// Extract address from the decoded instruction's destination location
+					var addr uint64
+					if len(disasm) > 0 && disasm[0].DestLoc != nil {
+						addr = disasm[0].DestLoc.PC
+					} else {
+						return false, fmt.Errorf("failed to extract call destination from instruction at PC %#x", pc)
+					}
+					fn := tgt.BinInfo().PCToFunc(addr)
+					if fn == nil {
+						return false, fmt.Errorf("PCToFunc returned nil")
+					}
+					err = createFunctionTracepoints(d, fn.Name, rootstr, followCalls)
+					if err != nil {
+						return false, fmt.Errorf("error creating tracepoint in function %s", fn.Name)
+					}
+					dynchildren, err := d.traverse(t, fn, sdepth+1, followCalls, rootstr)
+					if err != nil {
+						return false, fmt.Errorf("error calling traverse on dynamic children")
+					}
+					for _, child := range dynchildren {
+						err := createFunctionTracepoints(d, child, rootstr, followCalls)
+						if err != nil {
+							return false, fmt.Errorf("error creating tracepoint in function %s", child)
+						}
+					}
+					return false, nil
+				}
+				for _, dynBrklet := range dynbp.Breaklets {
+					dynBrklet.SetCallback(dynCallback)
+				}
+			}
+
 			if instr.IsCall() && instr.DestLoc != nil && instr.DestLoc.Fn != nil {
 				cf := instr.DestLoc.Fn
 				if (strings.HasPrefix(cf.Name, "runtime.") || strings.HasPrefix(cf.Name, "runtime/internal")) && cf.Name != "runtime.deferreturn" && cf.Name != "runtime.gorecover" && cf.Name != "runtime.gopanic" {
@@ -1427,6 +1539,70 @@ func traverse(t proc.ValidTargets, f *proc.Function, depth int, followCalls int)
 		}
 	}
 	return funcs, nil
+}
+
+// createFunctionTracepoints is a way to create a trace point late in the cycle but just in time that
+// it can be included in the trace output as in the case of dynamic functions, we get to know the
+// functions that are being called from deferreturn quite late in execution. This might create multiple
+// tracepoints
+func createFunctionTracepoints(d *Debugger, fname string, rootstr string, followCalls int) error {
+
+	// Helper function to create breakpoints for tracepoints
+	// Ignore BreakpointExistsError since duplicate tracepoints
+	// are expected during dynamic function discovery
+	createBrkForTracepoint := func(lbp *proc.LogicalBreakpoint) error {
+		d.breakpointIDCounter++
+		lbp.LogicalID = d.breakpointIDCounter
+		lbp.HitCount = make(map[int64]uint64)
+		d.target.LogicalBreakpoints[lbp.LogicalID] = lbp
+		err := d.target.SetBreakpointEnabled(lbp, true)
+		if err != nil {
+			delete(d.target.LogicalBreakpoints, lbp.LogicalID)
+			// Silently ignore BreakpointExistsError - this is expected when
+			// creating tracepoints for functions that may already have them
+			if _, exists := err.(proc.BreakpointExistsError); exists {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	// Create tracepoint for function entry
+	lbp := &proc.LogicalBreakpoint{
+		Set: proc.SetBreakpoint{
+			FunctionName: fname,
+		},
+		Tracepoint:       true,
+		RootFuncName:     rootstr,
+		Stacktrace:       20,
+		TraceFollowCalls: followCalls,
+	}
+
+	err := createBrkForTracepoint(lbp)
+	if err != nil {
+		return fmt.Errorf("error creating breakpoint at function %s: %w", fname, err)
+	}
+
+	// Create tracepoints for function return locations
+	raddrs, _ := d.functionReturnLocationsInternal(fname)
+	for i := range raddrs {
+		retLbp := &proc.LogicalBreakpoint{
+			Set: proc.SetBreakpoint{
+				PidAddrs: []proc.PidAddr{{Pid: d.target.Selected.Pid(), Addr: raddrs[i]}},
+			},
+			TraceReturn:      true,
+			RootFuncName:     rootstr,
+			Stacktrace:       20,
+			TraceFollowCalls: followCalls,
+		}
+
+		err := createBrkForTracepoint(retLbp)
+		if err != nil {
+			return fmt.Errorf("error creating breakpoint at function return %s: %w", fname, err)
+		}
+	}
+	return nil
 }
 
 // Types returns all type information in the binary.
@@ -1490,36 +1666,31 @@ func (d *Debugger) PackageVariables(filter string, cfg proc.LoadConfig) ([]*proc
 }
 
 // ThreadRegisters returns registers of the specified thread.
-func (d *Debugger) ThreadRegisters(threadID int) (*op.DwarfRegisters, error) {
+func (d *Debugger) ThreadRegisters(threadID int) (*op.DwarfRegisters, proc.DwarfRegisterToStringFunc, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
 	thread, found := d.target.Selected.FindThread(threadID)
 	if !found {
-		return nil, fmt.Errorf("couldn't find thread %d", threadID)
+		return nil, nil, fmt.Errorf("couldn't find thread %d", threadID)
 	}
 	regs, err := thread.Registers()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return d.target.Selected.BinInfo().Arch.RegistersToDwarfRegisters(0, regs), nil
+	return d.target.Selected.BinInfo().Arch.RegistersToDwarfRegisters(0, regs), d.target.Selected.BinInfo().Arch.DwarfRegisterToString, nil
 }
 
 // ScopeRegisters returns registers for the specified scope.
-func (d *Debugger) ScopeRegisters(goid int64, frame, deferredCall int) (*op.DwarfRegisters, error) {
+func (d *Debugger) ScopeRegisters(goid int64, frame, deferredCall int) (*op.DwarfRegisters, proc.DwarfRegisterToStringFunc, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
 	s, err := proc.ConvertEvalScope(d.target.Selected, goid, frame, deferredCall)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &s.Regs, nil
-}
-
-// DwarfRegisterToString returns the name and value representation of the given register.
-func (d *Debugger) DwarfRegisterToString(i int, reg *op.DwarfRegister) (string, bool, string) {
-	return d.target.Selected.BinInfo().Arch.DwarfRegisterToString(i, reg)
+	return &s.Regs, d.target.Selected.BinInfo().Arch.DwarfRegisterToString, nil
 }
 
 // LocalVariables returns a list of the local variables.
@@ -1890,7 +2061,7 @@ func (d *Debugger) CurrentPackage() (string, error) {
 	if _, err := d.target.Valid(); err != nil {
 		return "", err
 	}
-	loc, err := d.target.Selected.CurrentThread().Location()
+	loc, err := proc.ThreadLocation(d.target.Selected.CurrentThread())
 	if err != nil {
 		return "", err
 	}
@@ -2057,7 +2228,7 @@ func (d *Debugger) ClearCheckpoint(id int) error {
 func (d *Debugger) ListDynamicLibraries() []*proc.Image {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
-	return d.target.Selected.BinInfo().Images[1:] // skips the first image because it's the executable file
+	return d.target.Selected.BinInfo().Images
 }
 
 // ExamineMemory returns the raw memory stored at the given address.
@@ -2136,14 +2307,10 @@ func (d *Debugger) StopReason() proc.StopReason {
 	return d.target.Selected.StopReason
 }
 
-// LockTarget acquires the target mutex.
-func (d *Debugger) LockTarget() {
+// LockTargetGroup locks the target group and returns a function to unlock it.
+func (d *Debugger) LockTargetGroup() (*proc.TargetGroup, func()) {
 	d.targetMutex.Lock()
-}
-
-// UnlockTarget releases the target mutex.
-func (d *Debugger) UnlockTarget() {
-	d.targetMutex.Unlock()
+	return d.target, d.targetMutex.Unlock
 }
 
 // DumpStart starts a core dump to dest.
@@ -2219,16 +2386,10 @@ func (d *Debugger) DumpCancel() error {
 	return nil
 }
 
-func (d *Debugger) Target() *proc.Target {
-	return d.target.Selected
-}
-
-func (d *Debugger) TargetGroup() *proc.TargetGroup {
-	return d.target
-}
-
 func (d *Debugger) BuildID() string {
-	loc, err := d.target.Selected.CurrentThread().Location()
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	loc, err := proc.ThreadLocation(d.target.Selected.CurrentThread())
 	if err != nil {
 		return ""
 	}
@@ -2449,6 +2610,8 @@ func (d *Debugger) maybePrintUnattendedStopWarning(stopReason proc.StopReason, c
 // server paths to client paths by examining the executable file and a map
 // of module paths to client directories (clientMod2Dir) passed as input.
 func (d *Debugger) GuessSubstitutePath(args *api.GuessSubstitutePathIn) map[string]string {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
 	bis := []*proc.BinaryInfo{}
 	bins := [][]proc.Function{}
 	tgt := proc.ValidTargets{Group: d.target}
@@ -2461,6 +2624,21 @@ func (d *Debugger) GuessSubstitutePath(args *api.GuessSubstitutePathIn) map[stri
 		file, _ := bis[biIdx].EntryLineForFunc(fn)
 		return file
 	})
+}
+
+// CancelDownloads cancels ongoing downloads, if any.
+func (d *Debugger) CancelDownloads() bool {
+	if d.isRecording() {
+		return false
+	}
+	return d.target.CancelDownloads()
+}
+
+// DownloadLibraryDebugInfo attempts to download the specified library's debug info.
+func (d *Debugger) DownloadLibraryDebugInfo(n int) error {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	return d.target.Selected.BinInfo().LoadImageBinaryInfoAgain(n)
 }
 
 func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function, fileForFunc func(int, *proc.Function) string) map[string]string {
@@ -2564,7 +2742,7 @@ func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function
 			if slashes(dir) < elems {
 				continue
 			}
-			for i := 0; i < elems; i++ {
+			for range elems {
 				dir = path.Dir(dir)
 			}
 
@@ -2597,4 +2775,46 @@ func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function
 	}
 
 	return server2Client
+}
+
+// TypeInfo returns informations about a type.
+func (d *Debugger) TypeInfo(name string) (*api.TypeInfo, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+	bi := d.target.Selected.BinInfo()
+	typ, err := bi.FindType(name)
+	if err != nil {
+		return nil, err
+	}
+	ctyp := typ.Common()
+	r := &api.TypeInfo{
+		Kind: ctyp.ReflectKind,
+		Size: ctyp.Size(),
+	}
+
+	switch typ := typ.(type) {
+	case *godwarf.StructType:
+		for _, field := range typ.Field {
+			r.Fields = append(r.Fields, api.TypeInfoField{Name: field.Name, Type: field.Type.String()})
+		}
+	case *godwarf.TypedefType:
+		r.RealType = typ.Type.String()
+	}
+
+	plainRcvrPfx := name + "."
+	ptrRcvrPfx := ""
+	if dot := strings.LastIndex(name, "."); dot > 0 {
+		ptrRcvrPfx = name[:dot] + ".(*" + name[dot+1:] + ")."
+	}
+	for i := range bi.Functions {
+		fn := &bi.Functions[i]
+		if fn.Trampoline /*|| strings.HasSuffix(fn.Name, "-fm")*/ {
+			continue
+		}
+		if strings.HasPrefix(fn.Name, plainRcvrPfx) || (ptrRcvrPfx != "" && strings.HasPrefix(fn.Name, ptrRcvrPfx)) {
+			r.Methods = append(r.Methods, api.TypeInfoMethod{Name: fn.Name})
+		}
+	}
+
+	return r, nil
 }

@@ -109,12 +109,16 @@ func setVariable(p *proc.Target, symbol, value string) error {
 	return scope.SetVariable(symbol, value)
 }
 
+func multiLineVar(v *proc.Variable) string {
+	return api.ConvertVar(v).StringWithOptions("", "", api.PrettyNewlines)
+}
+
 func TestVariableEvaluation(t *testing.T) {
 	protest.AllowRecording(t)
 	testcases := []struct {
 		name        string
 		st          reflect.Kind
-		value       interface{}
+		value       any
 		length, cap int64
 		childrenlen int
 	}{
@@ -443,7 +447,7 @@ func TestMultilineVariableEvaluation(t *testing.T) {
 		for _, tc := range testcases {
 			variable, err := evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
 			assertNoError(err, t, "EvalVariable() returned an error")
-			if ms := api.ConvertVar(variable).MultilineString("", ""); !matchStringOrPrefix(ms, tc.value) {
+			if ms := multiLineVar(variable); !matchStringOrPrefix(ms, tc.value) {
 				t.Fatalf("Expected %s got %q (variable %s)\n", tc.value, ms, variable.Name)
 			}
 		}
@@ -815,7 +819,7 @@ func getEvalExpressionTestCases() []varTest {
 		{"i2 << f1", false, "", "", "", errors.New("shift count type float64, must be unsigned integer")},
 		{"i2 << -1", false, "", "", "", errors.New("shift count must not be negative")},
 		{"*(i2 + i3)", false, "", "", "", errors.New("expression \"(i2 + i3)\" (int) can not be dereferenced")},
-		{"i2.member", false, "", "", "", errors.New("i2 (type int) is not a struct")},
+		{"i2.member", false, "", "", "", errors.New("i2 (type int) has no member member")},
 		{"fmt.Println(\"hello\")", false, "", "", "", errors.New("function calls not allowed without using 'call'")},
 		{"*nil", false, "", "", "", errors.New("nil can not be dereferenced")},
 		{"!nil", false, "", "", "", errors.New("operator ! can not be applied to \"nil\"")},
@@ -836,6 +840,7 @@ func getEvalExpressionTestCases() []varTest {
 		{"int8(i6)", false, "12", "12", "int8", nil},
 		{"string(byteslice[0])", false, `"t"`, `"t"`, "string", nil},
 		{"string(runeslice[0])", false, `"t"`, `"t"`, "string", nil},
+		{"[]uint8(messageVar)", false, `[]uint8 len: 5, cap: 5, [1,2,3,4,5]`, `[]uint8 len: 5, cap: 5, [...]`, "[]uint8", nil},
 
 		// misc
 		{"i1", true, "1", "1", "int", nil},
@@ -957,6 +962,11 @@ func getEvalExpressionTestCases() []varTest {
 		testcases = append(testcases, varTest{`**(**runtime.hmap)(uintptr(&m1))`, false, `…`, `…`, "runtime.hmap", nil})
 	}
 
+	if goversion.VersionAfterOrEqualRev(runtime.Version(), 1, 25, 2) {
+		testcases = append(testcases, varTest{"iface7", true, "interface {}(main.OnlyUsedInInterface) {s: \"test\"}", "interface {}(main.OnlyUsedInInterface) {s: \"test\"}", "interface {}", nil})
+
+	}
+
 	return testcases
 }
 
@@ -986,8 +996,8 @@ func TestEvalExpression(t *testing.T) {
 					return
 				}
 				if err != nil && err.Error() == "expression *ast.CompositeLit not implemented" {
-					if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) || runtime.GOARCH == "386" {
-						// composite literals not supported before 1.22
+					if runtime.GOARCH == "386" {
+						// composite literals are currently unsupported on 386
 						return
 					}
 				}
@@ -1003,14 +1013,7 @@ func TestEvalExpression(t *testing.T) {
 					}
 					switch e := tc.err.(type) {
 					case *altError:
-						ok := false
-						for _, tgtErr := range e.errs {
-							if tgtErr == err.Error() {
-								ok = true
-								break
-							}
-						}
-						if !ok {
+						if !slices.Contains(e.errs, err.Error()) {
 							t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 						}
 					default:
@@ -1058,7 +1061,7 @@ func TestMapEvaluation(t *testing.T) {
 		m1v, err := evalVariableWithCfg(p, "m1", pnormalLoadConfig)
 		assertNoError(err, t, "EvalVariable()")
 		m1 := api.ConvertVar(m1v)
-		t.Logf("m1 = %v", m1.MultilineString("", ""))
+		t.Logf("m1 = %v", multiLineVar(m1v))
 
 		if m1.Type != "map[string]main.astruct" {
 			t.Fatalf("Wrong type: %s", m1.Type)
@@ -1249,7 +1252,7 @@ func TestConstants(t *testing.T) {
 			assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", testcase.name))
 			assertVariable(t, variable, testcase)
 			cv := api.ConvertVar(variable)
-			str := cv.SinglelineStringFormatted("%#x")
+			str := cv.StringWithOptions("", "%#x", 0)
 			if str != testcase.alternate {
 				t.Errorf("for %s expected %q got %q when formatting in hexadecimal", testcase.name, testcase.alternate, str)
 			}
@@ -1261,7 +1264,7 @@ func TestIssue1075(t *testing.T) {
 	withTestProcess("clientdo", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "net/http.(*Client).Do")
 		assertNoError(grp.Continue(), t, "Continue()")
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			scope, err := proc.GoroutineScope(p, p.CurrentThread())
 			assertNoError(err, t, fmt.Sprintf("GoroutineScope (%d)", i))
 			vars, err := scope.LocalVariables(pnormalLoadConfig)
@@ -1360,6 +1363,9 @@ func TestCallFunction(t *testing.T) {
 		// Issue 3176
 		{`ref.String()[0]`, []string{`:byte:98`}, nil, 1},
 		{`ref.String()[20]`, nil, errors.New("index out of bounds"), 1},
+
+		// Issue 4136
+		{`nilptrtostruct.VRcvr(0)`, []string{}, errors.New("nil pointer dereference"), 0},
 	}
 
 	var testcases112 = []testCaseCallFunction{
@@ -1457,10 +1463,8 @@ func TestCallFunction(t *testing.T) {
 			}
 		}
 
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-			for _, tc := range testcases123 {
-				testCallFunction(t, grp, p, tc)
-			}
+		for _, tc := range testcases123 {
+			testCallFunction(t, grp, p, tc)
 		}
 
 		// LEAVE THIS AS THE LAST ITEM, IT BREAKS THE TARGET PROCESS!!!
@@ -1511,14 +1515,7 @@ func testCallFunctionIntl(t *testing.T, grp *proc.TargetGroup, p *proc.Target, t
 		}
 		switch e := tc.err.(type) {
 		case *altError:
-			ok := false
-			for _, tgtErr := range e.errs {
-				if tgtErr == err.Error() {
-					ok = true
-					break
-				}
-			}
-			if !ok {
+			if !slices.Contains(e.errs, err.Error()) {
 				t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 			}
 		default:
@@ -1588,6 +1585,62 @@ func testCallFunctionIntl(t *testing.T, grp *proc.TargetGroup, p *proc.Target, t
 	}
 }
 
+func TestIssue4051(t *testing.T) {
+	if testBackend == "rr" {
+		t.Skip("Skipping TestIssue4051 for rr backend due to Go runtime changes in newer versions")
+	}
+
+	protest.MustSupportFunctionCalls(t, testBackend)
+	protest.AllowRecording(t)
+	withTestProcess("issue4051", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		err := grp.Continue()
+		assertNoError(err, t, "initial continue to breakpoint failed")
+
+		err = proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), `main.Hello("world")`, pnormalLoadConfig, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		expectedError := "package main has no function Hello"
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		err = grp.Continue()
+		assertNoError(err, t, "initial continue to breakpoint failed")
+		err = proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), `main.Hello("world")`, pnormalLoadConfig, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+
+		expectedError = `expression "main.Hello" is not a function`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		v, err := evalVariableWithCfg(p, "main.Hello", pshortLoadConfig)
+		assertNoError(err, t, "eval of main.Hello returned an error")
+		assertVariable(t, v, varTest{"main.Hello", true, `"World"`, ``, `string`, nil})
+
+		v, err = evalVariableWithCfg(p, "os.a", pshortLoadConfig)
+		assertNoError(err, t, "eval of os.a returned an error")
+		assertVariable(t, v, varTest{"os.a", true, "1", ``, `int`, nil})
+
+		// TODO(deparker): we *should* get an error here, but the one we expect in this test
+		// is not the ideal error. We should really improve type checking in the evaluator.
+		v, err = evalVariableWithCfg(p, "main.f.func1.i", pshortLoadConfig)
+		expectedError = `main.f has no member func1`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+
+		_, err = evalVariableWithCfg(p, "main.f.func1.somethingthatdoesntexist", pshortLoadConfig)
+		expectedError = `main.f has no member func1`
+		if err.Error() != expectedError {
+			t.Fatalf("expected error %q, got %q", expectedError, err)
+		}
+	})
+}
+
 func TestIssue1531(t *testing.T) {
 	// Go 1.12 introduced a change to the map representation where empty cells can be marked with 1 instead of just 0.
 	withTestProcess("issue1531", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1598,14 +1651,7 @@ func TestIssue1531(t *testing.T) {
 			for i := 0; i < len(mv.Children); i += 2 {
 				cv := &mv.Children[i]
 				s := constant.StringVal(cv.Value)
-				found := false
-				for j := range keys {
-					if keys[j] == s {
-						found = true
-						break
-					}
-				}
-				if !found {
+				if !slices.Contains(keys, s) {
 					t.Errorf("key %q not allowed", s)
 					return
 				}
@@ -1893,10 +1939,6 @@ func TestCapturedVariable(t *testing.T) {
 
 func TestSetupRangeFramesCrash(t *testing.T) {
 	// See issue #3806
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("N/A")
-	}
-
 	for _, options := range []protest.BuildFlags{0, protest.EnableInlining | protest.EnableOptimization} {
 		withTestProcessArgs("setiterator", t, ".", []string{}, options, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 			setFileBreakpoint(p, t, fixture.Source, 48)
@@ -1923,7 +1965,7 @@ func TestClassicMap(t *testing.T) {
 		t.Skip("N/A")
 	}
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 27) {
-		panic("test expired, please remove")
+		t.Skip("noswissmap experiment removed in Go 1.27")
 	}
 	t.Setenv("GOEXPERIMENT", "noswissmap")
 
@@ -1962,14 +2004,7 @@ func TestClassicMap(t *testing.T) {
 					}
 					switch e := tc.err.(type) {
 					case *altError:
-						ok := false
-						for _, tgtErr := range e.errs {
-							if tgtErr == err.Error() {
-								ok = true
-								break
-							}
-						}
-						if !ok {
+						if !slices.Contains(e.errs, err.Error()) {
 							t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
 						}
 					default:
@@ -1986,12 +2021,93 @@ func TestClassicMap(t *testing.T) {
 
 func TestCallFunctionRegisterArg(t *testing.T) {
 	protest.MustSupportFunctionCalls(t, testBackend)
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("not supported")
-	}
 	withTestProcessArgs("issue3310", t, ".", []string{}, protest.AllNonOptimized, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 12)
 		assertNoError(grp.Continue(), t, "Continue()")
 		assertNoError(proc.EvalExpressionWithCalls(grp, p.SelectedGoroutine(), "value.Type()", pnormalLoadConfig, true), t, "EvalExpressionWithCalls")
+	})
+}
+
+func TestCapturedVarVisibleOnFirstLine(t *testing.T) {
+	// Checks that a variable captured by a closure is visible on the first
+	// line of the closure function.
+	// See issue #4000
+	skipOn(t, "broken", "linux", "386")
+	withTestProcess("issue4000", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		addrs, err := proc.FindFileLocation(p, fixture.Source, 7)
+		assertNoError(err, t, "FindFileLocation")
+		found := false
+		for _, addr := range addrs {
+			_, _, fn := p.BinInfo().PCToLine(addr)
+			if fn != nil && strings.HasPrefix(fn.Name, "main.main.") {
+				found = true
+				_, err := p.SetBreakpoint(int(addr), addr, proc.UserBreakpoint, nil)
+				assertNoError(err, t, "SetBreakpoint")
+			}
+		}
+		if !found {
+			t.Fatal("could not find main.main.func1 at :7")
+		}
+		assertNoError(grp.Continue(), t, "Continue()") // this stops inside main.main.func1
+		v := evalVariable(p, t, "test")
+		cv := api.ConvertVar(v)
+		t.Logf("test variable: %s", cv.SinglelineString())
+		if tgt, s := `"a string"`, cv.SinglelineString(); s != tgt {
+			t.Fatalf("test variable expected %q got %q", tgt, s)
+		}
+	})
+}
+
+// See issue #4116
+func TestEmbeddedStructMethodsAndFieldLookup(t *testing.T) {
+	varTestcases := []varTest{
+		{"v.Model", true, "\"B\"", "", "string", nil},
+		{"v.A.Model", false, "main.(*A).Model", "", "func() string", nil},
+		{"v1.X", false, "main.(*B1).X", "", "func()", nil},
+		{"v1.A1.X", false, "0", "", "int", nil},
+		{"v2.X", false, "main.(*B2).X", "", "func()", nil},
+		{"v2.B2.X", false, "main.(*B2).X", "", "func()", nil},
+		{"v2.B2.A2.X", true, "0", "", "int", nil},
+		{"v2.A2.X", true, "0", "", "int", nil},
+		{"v7.X", false, "main.A7.X", "", "func()", nil},
+		{"x.X", false, "main.(*A7).X", "", "func()", nil},
+		{"x1.X", false, "", "", "", errors.New("x1 (type void) has no member X")},
+		{"x2.X", false, "main.(*A7).X", "", "func()", nil},
+		{"x3.X", false, "main.(*A7).X", "", "func()", nil},
+		{"v9.V.X", false, "main.(*B9).X", "", "func()", nil},
+		{"a.X", false, "main.A8.X", "", "func()", nil},
+		{"b.X", false, "", "", "", errors.New("b has no member X")},
+		{"c.X", false, "main.(*A8).X", "", "func()", nil},
+		{"d.X", true, "1", "", "int", nil},
+		{"v3.X", false, "main.(*B3).X", "", "func()", nil},
+		{"v3.B3.X", false, "main.(*B3).X", "", "func()", nil},
+		{"v4.X", false, "main.(*A4).X", "", "func()", nil},
+		{"v4.TestX.X", false, "main.(*A4).X", "", "func()", nil},
+		{"v5.X", true, "0", "", "int", nil},
+		{"v5.B5.X", false, "main.main.func1", "", "func() string", nil},
+		{"v5.B5.A5.X", false, "main.main.func1", "", "func() string", nil},
+		{"v5.A5.X", false, "main.main.func1", "", "func() string", nil},
+		{"*(ch.buf)", true, "[0]int []", "", "[0]int", nil},
+		{"*(v6.Chan.buf)", true, "[0]struct struct {} []", "", "[0]struct struct {}", nil},
+		{"*(v6.buf)", false, "", "", "", errors.New("v6 has no member buf")},
+	}
+
+	withTestProcess("issue4116", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.Continue(), t, "Continue()")
+
+		for _, tc := range varTestcases {
+			variable, err := evalVariableWithCfg(p, tc.name, pnormalLoadConfig)
+			if tc.err == nil {
+				assertNoError(err, t, "EvalVariable() returned an error")
+				assertVariable(t, variable, tc)
+			} else {
+				if err == nil {
+					t.Fatalf("Expected error %s, got no error: %s\n", tc.err.Error(), api.ConvertVar(variable).SinglelineString())
+				}
+				if tc.err.Error() != err.Error() {
+					t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
+				}
+			}
+		}
 	})
 }

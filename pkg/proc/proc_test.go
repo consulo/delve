@@ -2,6 +2,7 @@ package proc_test
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -19,9 +20,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"text/tabwriter"
 	"time"
@@ -63,14 +65,7 @@ func TestMain(m *testing.M) {
 
 func matchSkipConditions(conditions ...string) bool {
 	for _, cond := range conditions {
-		condfound := false
-		for _, s := range []string{runtime.GOOS, runtime.GOARCH, testBackend, buildMode} {
-			if s == cond {
-				condfound = true
-				break
-			}
-		}
-		if !condfound {
+		if !slices.Contains([]string{runtime.GOOS, runtime.GOARCH, testBackend, buildMode}, cond) {
 			return false
 		}
 	}
@@ -122,7 +117,7 @@ func startTestProcessArgs(fixture protest.Fixture, t testing.TB, wd string, args
 	case "rr":
 		protest.MustHaveRecordingAllowed(t)
 		t.Log("recording")
-		grp, tracedir, err = gdbserial.RecordAndReplay(append([]string{fixture.Path}, args...), wd, true, []string{}, "", proc.OutputRedirect{}, proc.OutputRedirect{})
+		grp, tracedir, err = gdbserial.RecordAndReplay(append([]string{fixture.Path}, args...), wd, true, true, []string{}, "", proc.OutputRedirect{}, proc.OutputRedirect{})
 		t.Logf("replaying %q", tracedir)
 	default:
 		t.Fatal("unknown backend")
@@ -183,14 +178,7 @@ func assertLineNumber(p *proc.Target, t *testing.T, lineno int, descr string) (s
 
 func assertLineNumberIn(p *proc.Target, t *testing.T, linenos []int, descr string) (string, int) {
 	f, l := currentLineNumber(p, t)
-	found := false
-	for _, lineno := range linenos {
-		if l == lineno {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !slices.Contains(linenos, l) {
 		_, callerFile, callerLine, _ := runtime.Caller(1)
 		t.Fatalf("%s expected lines :%#v got %s:%d\n\tat %s:%d", descr, linenos, f, l, callerFile, callerLine)
 	}
@@ -320,7 +308,7 @@ func findFileLocation(p *proc.Target, t *testing.T, file string, lineno int) uin
 }
 
 func TestHalt(t *testing.T) {
-	stopChan := make(chan interface{}, 1)
+	stopChan := make(chan any, 1)
 	withTestProcess("loopprog", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.loop")
 		assertNoError(grp.Continue(), t, "Continue")
@@ -452,7 +440,6 @@ func countBreakpoints(p *proc.Target) int {
 }
 
 func TestNextConcurrent(t *testing.T) {
-	skipOn(t, "broken", "windows", "arm64")
 	testcases := []nextTest{
 		{8, 9},
 		{9, 10},
@@ -488,7 +475,6 @@ func TestNextConcurrent(t *testing.T) {
 }
 
 func TestNextConcurrentVariant2(t *testing.T) {
-	skipOn(t, "broken", "windows", "arm64")
 	// Just like TestNextConcurrent but instead of removing the initial breakpoint we check that when it happens is for other goroutines
 	testcases := []nextTest{
 		{8, 9},
@@ -539,21 +525,49 @@ func TestNextConcurrentVariant2(t *testing.T) {
 
 func TestNextNetHTTP(t *testing.T) {
 	testcases := []nextTest{
-		{11, 12},
-		{12, 13},
+		{14, 15},
+		{15, 16},
 	}
 	withTestProcess("testnextnethttp", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		pid := p.Pid()
+		tmpdir := os.TempDir()
+		portFile := filepath.Join(tmpdir, fmt.Sprintf("testnextnethttp_port_%d", pid))
+
+		defer os.Remove(portFile)
+
 		go func() {
-			// Wait for program to start listening.
+			// Wait for program to write the port to file with timeout
+			var port int
+			t0 := time.Now()
 			for {
-				conn, err := net.Dial("tcp", "127.0.0.1:9191")
+				if data, err := os.ReadFile(portFile); err == nil {
+					if parsedPort, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+						port = parsedPort
+						break
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+				if time.Since(t0) > 10*time.Second {
+					t.Errorf("timeout waiting for port file")
+					return
+				}
+			}
+
+			// Wait for program to start listening with timeout
+			t0 = time.Now()
+			for {
+				conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 				if err == nil {
 					conn.Close()
 					break
 				}
 				time.Sleep(50 * time.Millisecond)
+				if time.Since(t0) > 10*time.Second {
+					t.Errorf("timeout waiting for server to start listening")
+					return
+				}
 			}
-			resp, err := http.Get("http://127.0.0.1:9191")
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d", port))
 			if err == nil {
 				resp.Body.Close()
 			}
@@ -963,6 +977,33 @@ func TestBreakpointOnFunctionEntry(t *testing.T) {
 	testseq2(t, "testprog", "main.main", []seqTest{{contContinue, 17}})
 }
 
+func TestFirstStmtOptimizedBinaries(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestProcessArgs("multinamedreturns", t, ".", []string{}, protest.EnableOptimization, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		_ = setFunctionBreakpoint(p, t, "main.ManyArgsWithNamedReturns")
+
+		assertNoError(grp.Continue(), t, "Continue()")
+
+		pc := currentPC(p, t)
+
+		fn := p.BinInfo().PCToFunc(pc)
+		if fn == nil {
+			t.Fatal("Could not find function for current PC")
+		}
+		if fn.Name != "main.ManyArgsWithNamedReturns" {
+			t.Fatalf("Expected to be in main.ManyArgsWithNamedReturns, got %s", fn.Name)
+		}
+
+		_, f, l, _ := currentLocation(p, t)
+		if !strings.Contains(f, "multinamedreturns.go") || l != 7 {
+			t.Fatalf("Expected file name to be multinamedreturns.go and line number to be 7, got %s:%d", f, l)
+		}
+		if pc == fn.End-1 {
+			t.Fatalf("PC is at function end (0x%x), expected to be at function entry", pc)
+		}
+	})
+}
+
 func TestProcessReceivesSIGCHLD(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestProcess("sigchldprog", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1244,7 +1285,7 @@ func TestBreakpointCounts(t *testing.T) {
 }
 
 func TestHardcodedBreakpointCounts(t *testing.T) {
-	skipOn(t, "broken", "windows", "arm64")
+	skipOn(t, "flaky", "windows", "arm64")
 	withTestProcess("hcbpcountstest", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		counts := map[int64]int{}
 		for {
@@ -1392,6 +1433,7 @@ func BenchmarkGoroutinesInfo(b *testing.B) {
 
 func TestIssue262(t *testing.T) {
 	// Continue does not work when the current breakpoint is set on a NOP instruction
+	skipOn(t, "N/A", "386")
 	protest.AllowRecording(t)
 	withTestProcess("issue262", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 11)
@@ -1627,7 +1669,7 @@ func TestStepIntoFunction(t *testing.T) {
 		// Step into function
 		assertNoError(grp.Step(), t, "Step() returned an error")
 		// We should now be inside the function.
-		loc, err := p.CurrentThread().Location()
+		loc, err := proc.ThreadLocation(p.CurrentThread())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1833,15 +1875,46 @@ func TestCmdLineArgs(t *testing.T) {
 func TestIssue462(t *testing.T) {
 	skipOn(t, "broken", "windows") // Stacktrace of Goroutine 0 fails with an error
 	withTestProcess("testnextnethttp", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		pid := p.Pid()
+		tmpdir := os.TempDir()
+		portFile := filepath.Join(tmpdir, fmt.Sprintf("testnextnethttp_port_%d", pid))
+
+		// Ensure cleanup of port file
+		defer func() {
+			os.Remove(portFile)
+		}()
+
 		go func() {
-			// Wait for program to start listening.
+			// Wait for program to write the port to file with timeout
+			var port int
+			t0 := time.Now()
 			for {
-				conn, err := net.Dial("tcp", "127.0.0.1:9191")
+				if data, err := os.ReadFile(portFile); err == nil {
+					if parsedPort, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+						port = parsedPort
+						break
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+				if time.Since(t0) > 10*time.Second {
+					t.Errorf("timeout waiting for port file")
+					return
+				}
+			}
+
+			// Wait for program to start listening with timeout
+			t0 = time.Now()
+			for {
+				conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 				if err == nil {
 					conn.Close()
 					break
 				}
 				time.Sleep(50 * time.Millisecond)
+				if time.Since(t0) > 10*time.Second {
+					t.Errorf("timeout waiting for server to start listening")
+					return
+				}
 			}
 
 			grp.RequestManualStop()
@@ -2060,7 +2133,6 @@ func TestStepOut(t *testing.T) {
 }
 
 func TestStepConcurrentDirect(t *testing.T) {
-	skipOn(t, "broken - step concurrent", "windows", "arm64")
 	protest.AllowRecording(t)
 	withTestProcess("teststepconcurrent", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 37)
@@ -2383,7 +2455,7 @@ func TestNegativeIntEvaluation(t *testing.T) {
 	testcases := []struct {
 		name  string
 		typ   string
-		value interface{}
+		value any
 	}{
 		{"ni8", "int8", int64(-5)},
 		{"ni16", "int16", int64(-5)},
@@ -2410,7 +2482,7 @@ func TestIssue683(t *testing.T) {
 	withTestProcess("issue683", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(grp.Continue(), t, "First Continue()")
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			// eventually an error about the source file not being found will be
 			// returned, the important thing is that we shouldn't panic
 			err := grp.Step()
@@ -2461,8 +2533,8 @@ func TestNextInDeferReturn(t *testing.T) {
 		// can not step out of the runtime.deferreturn and all the way to the
 		// point where the target program panics.
 		setFunctionBreakpoint(p, t, "main.sampleFunction")
-		for i := 0; i < 20; i++ {
-			loc, err := p.CurrentThread().Location()
+		for i := range 20 {
+			loc, err := proc.ThreadLocation(p.CurrentThread())
 			assertNoError(err, t, "CurrentThread().Location()")
 			t.Logf("at %#x %s:%d", loc.PC, loc.File, loc.Line)
 			if loc.Fn != nil && loc.Fn.Name == "main.sampleFunction" {
@@ -2494,17 +2566,46 @@ func TestAttachDetach(t *testing.T) {
 	cmd.Stderr = os.Stderr
 	assertNoError(cmd.Start(), t, "starting fixture")
 
-	// wait for testnextnethttp to start listening
+	// Read port from PID-specific file and wait for testnextnethttp to start listening
+	var port int
+	pid := cmd.Process.Pid
+	tmpdir := os.TempDir()
+	portFile := filepath.Join(tmpdir, fmt.Sprintf("testnextnethttp_port_%d", pid))
+
+	// Ensure cleanup of port file
+	defer func() {
+		os.Remove(portFile)
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}()
+
+	// First wait for port file to be written
 	t0 := time.Now()
 	for {
-		conn, err := net.Dial("tcp", "127.0.0.1:9191")
+		if data, err := os.ReadFile(portFile); err == nil {
+			if parsedPort, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				port = parsedPort
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+		if time.Since(t0) > 10*time.Second {
+			t.Fatal("fixture did not write port file")
+		}
+	}
+
+	// Then wait for server to start listening
+	t0 = time.Now()
+	for {
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			conn.Close()
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 		if time.Since(t0) > 10*time.Second {
-			t.Fatal("fixture did not start")
+			t.Fatal("fixture did not start listening")
 		}
 	}
 
@@ -2527,21 +2628,21 @@ func TestAttachDetach(t *testing.T) {
 	assertNoError(err, t, "Attach")
 	go func() {
 		time.Sleep(1 * time.Second)
-		resp, err := http.Get("http://127.0.0.1:9191")
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d", port))
 		if err == nil {
 			resp.Body.Close()
 		}
 	}()
 
 	assertNoError(p.Continue(), t, "Continue")
-	assertLineNumber(p.Selected, t, 11, "Did not continue to correct location,")
+	assertLineNumber(p.Selected, t, 14, "Did not continue to correct location,")
 
 	assertNoError(p.Detach(false), t, "Detach")
 
 	if runtime.GOOS != "darwin" {
 		// Debugserver sometimes will leave a zombie process after detaching, this
 		// seems to be a bug with debugserver.
-		resp, err := http.Get("http://127.0.0.1:9191/nobp")
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/nobp", port))
 		assertNoError(err, t, "Page request after detach")
 		bs, err := io.ReadAll(resp.Body)
 		assertNoError(err, t, "Reading /nobp page")
@@ -2882,20 +2983,20 @@ func logStacktrace(t *testing.T, p *proc.Target, frames []proc.Stackframe) {
 			topmostdefer = fmt.Sprintf("%#x %s", frames[j].TopmostDefer.DwrapPC, fnname)
 		}
 
-		defers := ""
+		var defers strings.Builder
 		for deferIdx, _defer := range frames[j].Defers {
 			_, _, fn := _defer.DeferredFunc(p)
 			fnname := ""
 			if fn != nil {
 				fnname = fn.Name
 			}
-			defers += fmt.Sprintf("%d %#x %s |", deferIdx, _defer.DwrapPC, fnname)
+			defers.WriteString(fmt.Sprintf("%d %#x %s |", deferIdx, _defer.DwrapPC, fnname))
 		}
 
 		frame := frames[j]
 		fmt.Fprintf(w, "%#x\t%#x\t%#x\t%#x\t%#x\t%s\t%s:%d\t%s\t%s\t\n",
 			frame.Call.PC, frame.FrameOffset(), frame.FramePointerOffset(), frame.Current.PC, frame.Ret,
-			name, filepath.Base(frame.Call.File), frame.Call.Line, topmostdefer, defers)
+			name, filepath.Base(frame.Call.File), frame.Call.Line, topmostdefer, defers.String())
 	}
 	w.Flush()
 }
@@ -2972,11 +3073,6 @@ func TestCgoStacktrace(t *testing.T) {
 	skipOn(t, "broken - cgo stacktraces", "386")
 	skipOn(t, "broken - cgo stacktraces", "windows", "arm64")
 	skipOn(t, "broken - cgo stacktraces", "linux", "ppc64le")
-	skipOn(t, "broken - cgo stacktraces", "linux", "riscv64")
-	skipOn(t, "broken - cgo stacktraces", "linux", "loong64")
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 21) {
-		skipOn(t, "broken - cgo stacktraces", "windows", "arm64")
-	}
 	protest.MustHaveCgo(t)
 
 	// Tests that:
@@ -3184,7 +3280,7 @@ func TestIssue1008(t *testing.T) {
 	withTestProcess("cgostacktest/", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(grp.Continue(), t, "Continue()")
-		loc, err := p.CurrentThread().Location()
+		loc, err := proc.ThreadLocation(p.CurrentThread())
 		assertNoError(err, t, "CurrentThread().Location()")
 		t.Logf("location %v\n", loc)
 		if !strings.HasSuffix(loc.File, "/main.go") {
@@ -3656,8 +3752,6 @@ func TestIssue951(t *testing.T) {
 
 func TestDWZCompression(t *testing.T) {
 	skipOn(t, "broken", "ppc64le")
-	skipOn(t, "broken", "riscv64")
-	skipOn(t, "broken", "loong64")
 	// If dwz is not available in the system, skip this test
 	if _, err := exec.LookPath("dwz"); err != nil {
 		t.Skip("dwz not installed")
@@ -4012,21 +4106,12 @@ func TestDeadlockBreakpoint(t *testing.T) {
 	})
 }
 
-func findSource(source string, sources []string) bool {
-	for _, s := range sources {
-		if s == source {
-			return true
-		}
-	}
-	return false
-}
-
 func TestListImages(t *testing.T) {
 	protest.MustHaveCgo(t)
 	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
 
 	withTestProcessArgs("plugintest", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
-		if !findSource(fixture.Source, p.BinInfo().Sources) {
+		if !slices.Contains(p.BinInfo().Sources, fixture.Source) {
 			t.Fatalf("could not find %s in sources: %q\n", fixture.Source, p.BinInfo().Sources)
 		}
 
@@ -4043,7 +4128,7 @@ func TestListImages(t *testing.T) {
 		if !plugin1Found {
 			t.Fatalf("Could not find plugin1")
 		}
-		if !findSource(fixture.Source, p.BinInfo().Sources) {
+		if !slices.Contains(p.BinInfo().Sources, fixture.Source) {
 			// Source files for the base program must be available even after a plugin is loaded. Issue #2074.
 			t.Fatalf("could not find %s in sources (after loading plugin): %q\n", fixture.Source, p.BinInfo().Sources)
 		}
@@ -4187,6 +4272,55 @@ func TestPluginStepping(t *testing.T) {
 		{contNext, "plugintest2.go:42"}})
 }
 
+func TestBreakpointMaterializedEvent(t *testing.T) {
+	protest.MustHaveCgo(t)
+	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
+
+	withTestProcessArgs("plugintest2", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		path := filepath.Join(fixture.BuildDir, "plugin2", "plugin2.go")
+		const lineno = 23
+
+		// Set a suspended breakpoint.
+		bp2 := &proc.LogicalBreakpoint{
+			LogicalID: 2,
+			HitCount:  make(map[int64]uint64),
+			Set:       proc.SetBreakpoint{File: path, Line: lineno},
+		}
+		grp.LogicalBreakpoints[2] = bp2
+		err := grp.SetBreakpointEnabled(bp2, true)
+		if !errors.As(err, new(*proc.ErrCouldNotFindLine)) {
+			if err == nil {
+				t.Fatal("Expected not to be able to find the breakpoint")
+			} else {
+				t.Fatal(err)
+			}
+		}
+
+		// Collect events
+		var events []*proc.Event
+		grp.SetEventsFn(func(e *proc.Event) { events = append(events, e) })
+
+		// Continue past the plugin load.
+		setFileBreakpoint(p, t, fixture.Source, 35)
+		assertNoError(grp.Continue(), t, "Continue")
+
+		// The breakpoint should be enabled now
+		if !bp2.Enabled() {
+			t.Fatal("Breakpoint did not materialize")
+		}
+		var found bool
+		for _, e := range events {
+			if e.Kind == proc.EventBreakpointMaterialized {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("No breakpoint materialized event found in %d events", len(events))
+		}
+	})
+}
+
 func TestIssue1601(t *testing.T) {
 	protest.MustHaveCgo(t)
 	// Tests that recursive types involving C qualifiers and typedefs are parsed correctly
@@ -4219,9 +4353,8 @@ func TestCgoStacktrace2(t *testing.T) {
 	}
 	skipOn(t, "broken", "386")
 	skipOn(t, "broken - cgo stacktraces", "darwin", "arm64")
+	skipOn(t, "broken - cgo stacktraces", "windows", "arm64")
 	skipOn(t, "broken", "ppc64le")
-	skipOn(t, "broken", "riscv64")
-	skipOn(t, "broken", "loong64")
 	protest.MustHaveCgo(t)
 	// If a panic happens during cgo execution the stacktrace should show the C
 	// function that caused the problem.
@@ -4884,7 +5017,7 @@ func TestManualStopWhileStopped(t *testing.T) {
 			repeatsFast = 5
 		)
 
-		for i := 0; i < repeatsSlow; i++ {
+		for i := range repeatsSlow {
 			t.Logf("Continue %d (slow)", i)
 			done := make(chan struct{})
 			go asyncCont(done)
@@ -4895,7 +5028,7 @@ func TestManualStopWhileStopped(t *testing.T) {
 			time.Sleep(1 * time.Second)
 			<-done
 		}
-		for i := 0; i < repeatsFast; i++ {
+		for i := range repeatsFast {
 			t.Logf("Continue %d (fast)", i)
 			rch := make(chan struct{})
 			done := make(chan struct{})
@@ -5069,6 +5202,31 @@ func TestWatchpointStackBackwardsOutOfScope(t *testing.T) {
 	})
 }
 
+func TestWatchpointStackRecordedOutOfScopeBreakletIndex(t *testing.T) {
+	// Regression: setStackWatchBreakpoints (recorded replay) adds a second
+	// WatchOutOfScope breakpoint at the CALL before the return PC. The last
+	// breaklet must be taken from retbp2, not indexed with len(retbp.Breaklets).
+	// If a user breakpoint already exists at the return PC (here: main after f()
+	// returns), retbp accumulates an extra breaklet while retbp2 does not, and
+	// using len(retbp)-1 to index retbp2 panics.
+	skipUnlessOn(t, "only for recorded targets", "rr")
+	protest.AllowRecording(t)
+
+	withTestProcess("databpstack", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		setFileBreakpoint(p, t, fixture.Source, 11) // stop in f() at g(1000, &w)
+		setFileBreakpoint(p, t, fixture.Source, 24) // same return PC as stack-watch OOS sentinel (after f returns to main)
+
+		assertNoError(grp.Continue(), t, "Continue 0")
+		assertLineNumber(p, t, 11, "Continue 0")
+
+		scope, err := proc.GoroutineScope(p, p.CurrentThread())
+		assertNoError(err, t, "GoroutineScope")
+
+		_, err = p.SetWatchpoint(0, scope, "w", proc.WatchWrite, nil)
+		assertNoError(err, t, "SetWatchpoint with stack watch (recorded extra OOS breaklet)")
+	})
+}
+
 func TestSetOnFunctions(t *testing.T) {
 	// The set command between function variables should fail with an error
 	// Issue #2691
@@ -5159,6 +5317,9 @@ func TestFollowExec(t *testing.T) {
 		finished := false
 		pids := map[int]int{}
 		ns := map[string]int{}
+		events := []*proc.Event{}
+
+		grp.SetEventsFn(func(e *proc.Event) { events = append(events, e) })
 
 		for {
 			t.Log("Continuing")
@@ -5176,7 +5337,7 @@ func TestFollowExec(t *testing.T) {
 				if grp.Selected.CurrentThread().Breakpoint().Breakpoint.LogicalID() != 1 {
 					t.Fatalf("wrong breakpoint %#v", grp.Selected.CurrentThread().Breakpoint().Breakpoint)
 				}
-				loc, err := grp.Selected.CurrentThread().Location()
+				loc, err := proc.ThreadLocation(grp.Selected.CurrentThread())
 				assertNoError(err, t, "Location")
 				if loc.Fn.Name != "main.traceme1" {
 					t.Fatalf("wrong stop location %#v", loc)
@@ -5188,7 +5349,7 @@ func TestFollowExec(t *testing.T) {
 				if p.CurrentThread().Breakpoint().Breakpoint.LogicalID() != 3 {
 					t.Fatalf("wrong breakpoint %#v", p.CurrentThread().Breakpoint().Breakpoint)
 				}
-				loc, err := p.CurrentThread().Location()
+				loc, err := proc.ThreadLocation(p.CurrentThread())
 				assertNoError(err, t, "Location")
 				if loc.Fn.Name != "main.traceme3" {
 					t.Fatalf("wrong stop location %#v", loc)
@@ -5208,7 +5369,7 @@ func TestFollowExec(t *testing.T) {
 						t.Fatalf("wrong breakpoint %#v", grp.Selected.CurrentThread().Breakpoint().Breakpoint)
 					}
 					pids[tgt.Pid()]++
-					loc, err := tgt.CurrentThread().Location()
+					loc, err := proc.ThreadLocation(tgt.CurrentThread())
 					assertNoError(err, t, "Location")
 					if loc.Fn.Name != "main.traceme2" {
 						t.Fatalf("wrong stop location %#v", loc)
@@ -5243,6 +5404,126 @@ func TestFollowExec(t *testing.T) {
 				t.Errorf("bad contents of pids: %#v", pids)
 			}
 		}
+
+		spawned := map[int]*proc.ProcessSpawnedEventDetails{}
+		for _, event := range events {
+			if event.Kind == proc.EventProcessSpawned {
+				details := event.ProcessSpawnedEventDetails
+				spawned[details.PID] = details
+			}
+		}
+
+		for pid := range pids {
+			if _, ok := spawned[pid]; !ok {
+				t.Errorf("Expected a process spawned event for target %d", pid)
+			}
+		}
+	})
+}
+
+func TestFollowExecRegex(t *testing.T) {
+	skipOn(t, "follow exec not implemented on freebsd", "freebsd")
+	skipOn(t, "follow exec not implemented on macOS", "darwin")
+	withTestProcessArgs("spawn", t, ".", []string{"spawn", "3"}, 0, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		grp.LogicalBreakpoints[2] = &proc.LogicalBreakpoint{LogicalID: 2, Set: proc.SetBreakpoint{FunctionName: "main.traceme2"}, HitCount: make(map[int64]uint64)}
+
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[2], true), t, "EnableBreakpoint(main.traceme2)")
+
+		assertNoError(grp.FollowExec(true, "child C2"), t, "FollowExec")
+
+		cmdlines := map[int]string{}
+		events := []*proc.Event{}
+
+		grp.SetEventsFn(func(e *proc.Event) { events = append(events, e) })
+
+		for {
+			t.Log("Continuing")
+			err := grp.Continue()
+			if errors.As(err, &proc.ErrProcessExited{}) {
+				break
+			}
+			assertNoError(err, t, "Continue")
+
+			if grp.Selected == p {
+				t.Fatalf("unexpected break in parent process")
+			}
+
+			it := proc.ValidTargets{Group: grp}
+			for it.Next() {
+				tgt := it.Target
+				if !tgt.CurrentThread().Breakpoint().Active {
+					continue
+				}
+				if tgt.CurrentThread().Breakpoint().Breakpoint.LogicalID() != 2 {
+					t.Fatalf("wrong breakpoint %#v", grp.Selected.CurrentThread().Breakpoint().Breakpoint)
+				}
+				cmdlines[tgt.Pid()] = tgt.CmdLine
+				loc, err := proc.ThreadLocation(tgt.CurrentThread())
+				assertNoError(err, t, "Location")
+				if loc.Fn.Name != "main.traceme2" {
+					t.Fatalf("wrong stop location %#v", loc)
+				}
+			}
+		}
+
+		spawned := map[int]*proc.ProcessSpawnedEventDetails{}
+		for _, event := range events {
+			if event.Kind == proc.EventProcessSpawned {
+				details := event.ProcessSpawnedEventDetails
+				spawned[details.PID] = details
+			}
+		}
+
+		if len(cmdlines) != 1 {
+			t.Fatalf("bad content of cmdlines: want len(cmdlines) == 1, got %d", len(cmdlines))
+		}
+
+		for pid, cmdline := range cmdlines {
+			if !strings.Contains(cmdline, "child C2") {
+				t.Fatalf("bad contents of cmdline: want child C2, got %q", cmdline)
+			}
+
+			event, ok := spawned[pid]
+			if !ok {
+				t.Fatalf("bad content of events: want an event for child, got %#v", spawned)
+			}
+
+			if event.Cmdline != cmdline {
+				t.Fatalf("cmdline does not match: %q != %q", event.Cmdline, cmdline)
+			}
+		}
+	})
+}
+
+func TestFollowExecNonGo(t *testing.T) {
+	skipOn(t, "follow exec not implemented on freebsd", "freebsd")
+	skipOn(t, "follow exec not implemented on macOS", "darwin")
+	withTestProcessArgs("nongochild/", t, "../../_fixtures/nongochild/", []string{}, 0, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.FollowExec(true, ""), t, "FollowExec")
+
+		// Collect events
+		var events []*proc.Event
+		grp.SetEventsFn(func(e *proc.Event) { events = append(events, e) })
+
+		// Execute the process
+		for {
+			t.Log("Continuing")
+			err := grp.Continue()
+			if errors.As(err, &proc.ErrProcessExited{}) {
+				break
+			}
+		}
+
+		// Verify that a child was spawned
+		var spawned *proc.ProcessSpawnedEventDetails
+		for _, event := range events {
+			if event.Kind == proc.EventProcessSpawned {
+				spawned = event.ProcessSpawnedEventDetails
+			}
+		}
+		if spawned == nil {
+			t.Fatal("Did not log an event for the child")
+		}
 	})
 }
 
@@ -5268,7 +5549,7 @@ func TestStepShadowConcurrentBreakpoint(t *testing.T) {
 		for {
 			t.Logf("stop (%d %d):", stacktraceme1calls, stacktraceme2calls)
 			for _, th := range p.ThreadList() {
-				loc, _ := th.Location()
+				loc, _ := proc.ThreadLocation(th)
 				t.Logf("\t%s:%d\n", loc.File, loc.Line)
 				bp := th.Breakpoint().Breakpoint
 				if bp != nil && bp.Addr == break2.Addr {
@@ -5357,47 +5638,83 @@ func TestReadTargetArguments(t *testing.T) {
 	})
 }
 
-func testWaitForSetup(t *testing.T, mu *sync.Mutex, started *bool) (*exec.Cmd, *proc.WaitFor) {
+type waitForFixture struct {
+	t        *testing.T
+	cmd      *exec.Cmd
+	waitFor  *proc.WaitFor
+	startedc chan struct{}
+	startErr error
+}
+
+func testWaitForSetup(t *testing.T) *waitForFixture {
 	var buildFlags protest.BuildFlags
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
 	fixture := protest.BuildFixture(t, "loopprog", buildFlags)
 
-	cmd := exec.Command(fixture.Path)
+	// Workaround to prevent WaitFor from trying to attach to old,
+	// already terminated, executions of loopprog on Windows, see #4292.
+	uniqueArg := fmt.Sprintf("%s-%d", t.Name(), time.Now().Unix())
+	cmd := exec.Command(fixture.Path, uniqueArg)
+	startedc := make(chan struct{})
+
+	fixtureState := &waitForFixture{
+		t:        t,
+		cmd:      cmd,
+		startedc: startedc,
+	}
 
 	go func() {
 		time.Sleep(2 * time.Second)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		assertNoError(cmd.Start(), t, "starting fixture")
-		mu.Lock()
-		*started = true
-		mu.Unlock()
+		fixtureState.startErr = cmd.Start()
+		close(startedc)
 	}()
 
-	waitFor := &proc.WaitFor{Name: fixture.Path, Interval: 100 * time.Millisecond, Duration: 10 * time.Second}
+	waitFor := &proc.WaitFor{Name: fixture.Path + " " + uniqueArg, Interval: 100 * time.Millisecond, Duration: 10 * time.Second}
+	if runtime.GOOS == "darwin" && testBackend == "lldb" {
+		// LLDB/debugserver wait-for attach is by process name (or pid), not argv.
+		// See: https://lldb.llvm.org/man/lldb.html#cmdoption-lldb-wait-for
+		waitFor.Name = fixture.Path
+	}
+	fixtureState.waitFor = waitFor
 
-	return cmd, waitFor
+	return fixtureState
+}
+
+func (fixtureState *waitForFixture) waitStarted() {
+	fixtureState.t.Helper()
+	<-fixtureState.startedc
+	assertNoError(fixtureState.startErr, fixtureState.t, "starting fixture")
+	if fixtureState.cmd.Process == nil {
+		fixtureState.t.Fatal("fixture start succeeded but cmd.Process is nil")
+	}
+}
+
+func (fixtureState *waitForFixture) cleanup() {
+	<-fixtureState.startedc
+	if fixtureState.startErr != nil || fixtureState.cmd.Process == nil {
+		return
+	}
+	_ = fixtureState.cmd.Process.Kill()
+	_ = fixtureState.cmd.Wait()
 }
 
 func TestWaitFor(t *testing.T) {
 	skipOn(t, "waitfor implementation is delegated to debugserver", "darwin")
 	skipOn(t, "flaky", "freebsd")
 
-	var mu sync.Mutex
-	started := false
+	fixtureState := testWaitForSetup(t)
+	t.Cleanup(fixtureState.cleanup)
 
-	cmd, waitFor := testWaitForSetup(t, &mu, &started)
-
-	pid, err := native.WaitFor(waitFor)
+	pid, err := native.WaitFor(fixtureState.waitFor)
 	assertNoError(err, t, "waitFor.Wait()")
-	if pid != cmd.Process.Pid {
-		t.Errorf("pid mismatch, expected %d got %d", pid, cmd.Process.Pid)
+	fixtureState.waitStarted()
+	if pid != fixtureState.cmd.Process.Pid {
+		t.Errorf("pid mismatch, expected %d got %d", pid, fixtureState.cmd.Process.Pid)
 	}
-
-	cmd.Process.Kill()
-	cmd.Wait()
 }
 
 func TestWaitForAttach(t *testing.T) {
@@ -5413,38 +5730,29 @@ func TestWaitForAttach(t *testing.T) {
 		return
 	}
 
-	var mu sync.Mutex
-	started := false
-
-	cmd, waitFor := testWaitForSetup(t, &mu, &started)
+	fixtureState := testWaitForSetup(t)
+	t.Cleanup(fixtureState.cleanup)
 
 	var p *proc.TargetGroup
 	var err error
 
 	switch testBackend {
 	case "native":
-		p, err = native.Attach(0, waitFor, []string{})
+		p, err = native.Attach(0, fixtureState.waitFor, []string{})
 	case "lldb":
 		path := ""
 		if runtime.GOOS == "darwin" {
-			path = waitFor.Name
+			path = fixtureState.waitFor.Name
 		}
-		p, err = gdbserial.LLDBAttach(0, path, waitFor, []string{})
+		p, err = gdbserial.LLDBAttach(0, path, fixtureState.waitFor, []string{})
 	default:
 		err = fmt.Errorf("unknown backend %q", testBackend)
 	}
 
 	assertNoError(err, t, "Attach")
-
-	mu.Lock()
-	if !started {
-		t.Fatalf("attach succeeded but started is false")
-	}
-	mu.Unlock()
+	fixtureState.waitStarted()
 
 	p.Detach(true)
-
-	cmd.Wait()
 }
 
 func TestIssue3545(t *testing.T) {
@@ -5497,15 +5805,12 @@ func TestPanicLine(t *testing.T) {
 }
 
 func TestReadClosure(t *testing.T) {
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("not implemented")
-	}
 	withTestProcess("closurecontents", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		avalues := []int64{0, 3, 9, 27}
-		for i := 0; i < 4; i++ {
+		for i := range 4 {
 			assertNoError(grp.Continue(), t, "Continue()")
 			accV := evalVariable(p, t, "acc")
-			t.Log(api.ConvertVar(accV).MultilineString("", ""))
+			t.Log(multiLineVar(accV))
 			if len(accV.Children) != 2 {
 				t.Fatal("wrong number of children")
 			}
@@ -5766,4 +6071,119 @@ func TestChainedBreakpoint(t *testing.T) {
 			assertNoError(err, t, "Continue 4")
 		}
 	})
+}
+
+func TestDelveCatch(t *testing.T) {
+	withTestProcess("delvecatch", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		bp := setFileBreakpoint(p, t, fixture.Source, 7)
+		bp.UserBreaklet().Cond, _ = parser.ParseExpr(`delve.catch(iface.(data) == "hello")`)
+		assertNoError(grp.Continue(), t, "Continue")
+		assertLineNumber(p, t, 7, "continue")
+		assertVariable(t, evalVariable(p, t, "i"), varTest{name: "i", preserveName: true, value: "4", varType: "int"})
+	})
+}
+
+func TestTrimpathDetection(t *testing.T) {
+	f1 := protest.BuildFixture(t, "math", 0)
+	bi1 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	assertNoError(bi1.LoadBinaryInfo(f1.Path, 0x10000, nil), t, "LoadBinaryInfo")
+	if bi1.Images[0].Trimpath {
+		t.Error("expected trimpath used to be false, was true")
+	}
+
+	f2 := protest.BuildFixture(t, "math", protest.Trimpath)
+	buildinfo, _ := buildinfo.ReadFile(f2.Path)
+	fmt.Printf("%#v\n", buildinfo)
+
+	b2 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	assertNoError(b2.LoadBinaryInfo(f2.Path, 0x10000, nil), t, "LoadBinaryInfo")
+	if !b2.Images[0].Trimpath {
+		t.Error("expected trimpath used to be true, was false")
+	}
+}
+
+func TestNonGoBinaryWithGoDlopen(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("only supported on linux")
+	}
+	if testBackend != "native" {
+		t.Skip("only supported with native backend")
+	}
+	if objcopyPath, _ := exec.LookPath("cc"); objcopyPath == "" {
+		t.Skip("no C compiler in path")
+	}
+	protest.MustHaveCgo(t)
+
+	fixturesDir := protest.FindFixturesDir()
+	tmpdir := t.TempDir()
+	goSoPath := filepath.Join(tmpdir, "golib.so")
+
+	cmd := exec.Command("go", "build", "-buildmode=c-shared", "-o", goSoPath, ".")
+	cmd.Dir = filepath.Join(fixturesDir, "godlopen", "golib")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build Go shared object: %v\n%s", err, out)
+	}
+
+	cBinPath := filepath.Join(tmpdir, "godlopen")
+	cSrcPath := filepath.Join(fixturesDir, "godlopen", "main.c")
+	cmd = exec.Command("cc", "-g0", "-o", cBinPath, cSrcPath, "-ldl")
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build C binary: %v\n%s", err, out)
+	}
+
+	grp, err := native.Launch([]string{cBinPath, goSoPath}, tmpdir, 0, []string{}, "", "", proc.OutputRedirect{}, proc.OutputRedirect{})
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer grp.Detach(true)
+
+	p := grp.Selected
+
+	if len(p.BinInfo().Images) == 0 {
+		t.Fatal("no images loaded")
+	}
+	if p.BinInfo().Images[0].IsGo {
+		t.Error("expected Images[0].IsGo to be false")
+	}
+	if p.BinInfo().HasGoImage() {
+		t.Error("expected HasGoImage to be false before dlopen")
+	}
+
+	err = grp.Continue()
+	if err != nil {
+		t.Fatalf("Continue failed: %v", err)
+	}
+
+	if grp.Selected.StopReason != proc.StopSharedLibLoaded {
+		t.Fatalf("expected StopSharedLibLoaded stop reason, got %v", grp.Selected.StopReason)
+	}
+	if !p.BinInfo().HasGoImage() {
+		t.Fatal("expected HasGoImage to be true after shared library load")
+	}
+
+	expectedFuncs := map[string]bool{
+		"C.GoFunction": false,
+		"main.main":    false,
+	}
+	for _, fn := range p.BinInfo().Functions {
+		if _, ok := expectedFuncs[fn.Name]; ok {
+			expectedFuncs[fn.Name] = true
+		}
+	}
+	for name, found := range expectedFuncs {
+		if !found {
+			t.Errorf("could not find %s in loaded debug symbols", name)
+		}
+	}
+
+	// Continue again to let the process finish.
+	err = grp.Continue()
+	if err != nil {
+		var pe proc.ErrProcessExited
+		if !errors.As(err, &pe) {
+			t.Fatalf("second Continue failed: %v", err)
+		}
+	}
 }

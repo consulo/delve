@@ -9,14 +9,17 @@ import (
 	"net/rpc"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
-	"github.com/derekparker/trie"
+	"github.com/derekparker/trie/v3"
 	"github.com/go-delve/liner"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/locspec"
 	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
@@ -28,6 +31,7 @@ const (
 	historyFile                 string = ".dbg_history"
 	terminalHighlightEscapeCode string = "\033[%2dm"
 	terminalResetEscapeCode     string = "\033[0m"
+	defaultPrompt                      = "(dlv) "
 )
 
 const (
@@ -53,7 +57,6 @@ const (
 type Term struct {
 	client   service.Client
 	conf     *config.Config
-	prompt   string
 	line     *liner.State
 	cmds     *Commands
 	stdout   *transcriptWriter
@@ -80,6 +83,14 @@ type Term struct {
 	quitting      bool
 
 	traceNonInteractive bool
+	TraceVerbosity      int // Verbosity level for trace output (0-4)
+
+	downloadsMu         sync.Mutex
+	downloadsInProgress bool
+
+	goVersionCache *goversion.GoVersion
+	// customCommandsInvalidated is set when a runCmd is executed during custom command execution
+	customCommandsInvalidated []bool
 }
 
 type displayEntry struct {
@@ -101,7 +112,6 @@ func New(client service.Client, conf *config.Config) *Term {
 	t := &Term{
 		client: client,
 		conf:   conf,
-		prompt: "(dlv) ",
 		line:   liner.NewLiner(),
 		cmds:   cmds,
 		stdout: &transcriptWriter{pw: &pagingWriter{w: os.Stdout}},
@@ -122,6 +132,45 @@ func New(client service.Client, conf *config.Config) *Term {
 		if state, err := client.GetState(); err == nil {
 			t.oldPid = state.Pid
 		}
+		firstEventBinaryInfoDownload := true
+		client.SetEventsFn(func(event *api.Event) {
+			switch event.Kind {
+			case api.EventResumed:
+				firstEventBinaryInfoDownload = true
+			case api.EventBinaryInfoDownload:
+				t.downloadsMu.Lock()
+				t.downloadsInProgress = true
+				t.downloadsMu.Unlock()
+				if !firstEventBinaryInfoDownload {
+					fmt.Fprintf(t.stdout, "\r")
+					if strings.ToLower(os.Getenv("TERM")) != "dumb" {
+						fmt.Fprintf(t.stdout, "\x1b[J") // clear to the end of the line
+					}
+				}
+				fmt.Fprintf(t.stdout, "Downloading debug info for %s: %s (press ^C to cancel)", event.BinaryInfoDownloadEventDetails.ImagePath, event.BinaryInfoDownloadEventDetails.Progress)
+				firstEventBinaryInfoDownload = false
+			case api.EventStopped:
+				t.downloadsMu.Lock()
+				t.downloadsInProgress = false
+				t.downloadsMu.Unlock()
+				if !firstEventBinaryInfoDownload {
+					fmt.Fprintf(t.stdout, "\n")
+				}
+			case api.EventBreakpointMaterialized:
+				bp := event.BreakpointMaterializedEventDetails.Breakpoint
+				file := t.formatPath(bp.File)
+
+				// Append the function name.
+				var extra string
+				if bp.FunctionName != "" {
+					extra = " (" + bp.FunctionName + ")"
+				}
+
+				fmt.Fprintf(t.stdout, "Breakpoint %d materialized at %s:%d%s\n", bp.ID, file, bp.Line, extra)
+			case api.EventProcessSpawned:
+				fmt.Fprintf(t.stdout, "Spawned new process '%s' (%d)\n", event.Cmdline, event.ProcessSpawnedEventDetails.PID)
+			}
+		})
 	}
 
 	t.starlarkEnv = starbind.New(starlarkContext{t}, t.stdout)
@@ -198,6 +247,14 @@ func (t *Term) Close() {
 
 func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 	for range ch {
+		t.downloadsMu.Lock()
+		downloadsInProgress := t.downloadsInProgress
+		t.downloadsMu.Unlock()
+		if downloadsInProgress {
+			t.client.CancelDownloads()
+			continue
+		}
+
 		t.longCommandCancel()
 		t.starlarkEnv.Cancel()
 		state, err := t.client.GetStateNonBlocking()
@@ -264,19 +321,15 @@ func (t *Term) Run() (int, error) {
 	signal.Notify(ch, syscall.SIGINT)
 	go t.sigintGuard(ch, multiClient)
 
-	fns := trie.New()
-	cmds := trie.New()
-	funcs, _ := t.client.ListFunctions("", 0)
-	for _, fn := range funcs {
-		fns.Add(fn, nil)
-	}
+	cmds := trie.New[any]()
 	for _, cmd := range t.cmds.cmds {
 		for _, alias := range cmd.aliases {
 			cmds.Add(alias, nil)
 		}
 	}
 
-	var locs *trie.Trie
+	var fns *trie.Trie[any]
+	var locs *trie.Trie[any]
 
 	t.line.SetCompleter(func(line string) (c []string) {
 		cmd := t.cmds.Find(strings.Split(line, " ")[0], noPrefix)
@@ -284,6 +337,13 @@ func (t *Term) Run() (int, error) {
 		case "break", "trace", "continue":
 			if spc := strings.LastIndex(line, " "); spc > 0 {
 				prefix := line[:spc] + " "
+				if fns == nil {
+					fns = trie.New[any]()
+					funcs, _ := t.client.ListFunctions("", 0)
+					for _, fn := range funcs {
+						fns.Add(fn, nil)
+					}
+				}
 				funcs := fns.FuzzySearch(line[spc+1:])
 				for _, f := range funcs {
 					c = append(c, prefix+f)
@@ -303,7 +363,7 @@ func (t *Term) Run() (int, error) {
 					break
 				}
 
-				locs = trie.New()
+				locs = trie.New[any]()
 				for _, loc := range localVars {
 					locs.Add(loc.Name, nil)
 				}
@@ -354,7 +414,12 @@ func (t *Term) Run() (int, error) {
 	for {
 		locs = nil
 
-		cmdstr, err := t.promptForInput()
+		prompt := defaultPrompt
+		if t.conf != nil && t.conf.Prompt != "" {
+			prompt = t.expandPrompt(t.conf.Prompt)
+		}
+
+		cmdstr, err := t.promptForInput(prompt)
 		if err != nil {
 			if err == io.EOF {
 				fmt.Fprintln(t.stdout, "exit")
@@ -362,7 +427,7 @@ func (t *Term) Run() (int, error) {
 			}
 			return 1, errors.New("Prompt for input failed.\n")
 		}
-		t.stdout.Echo(t.prompt + cmdstr + "\n")
+		t.stdout.Echo(prompt + cmdstr + "\n")
 
 		if strings.TrimSpace(cmdstr) == "" {
 			cmdstr = lastCmd
@@ -435,12 +500,12 @@ func (t *Term) formatPath(path string) string {
 	return strings.Replace(path, workingDir, ".", 1)
 }
 
-func (t *Term) promptForInput() (string, error) {
+func (t *Term) promptForInput(prompt string) (string, error) {
 	if t.stdout.colorEscapes != nil && t.conf.PromptColor != "" {
 		fmt.Fprint(os.Stdout, t.conf.PromptColor)
 		defer fmt.Fprint(os.Stdout, terminalResetEscapeCode)
 	}
-	l, err := t.line.Prompt(t.prompt)
+	l, err := t.line.Prompt(prompt)
 	if err != nil {
 		return "", err
 	}
@@ -590,7 +655,7 @@ func (t *Term) printDisplay(i int) {
 		fmt.Fprintf(t.stdout, "%d: %s = error %v\n", i, expr, err)
 		return
 	}
-	fmt.Fprintf(t.stdout, "%d: %s = %s\n", i, val.Name, val.SinglelineStringFormatted(fmtstr))
+	fmt.Fprintf(t.stdout, "%d: %s = %s\n", i, val.Name, val.StringWithOptions("", fmtstr, 0))
 }
 
 func (t *Term) printDisplays() {
@@ -603,6 +668,7 @@ func (t *Term) printDisplays() {
 
 func (t *Term) onStop() {
 	t.printDisplays()
+	t.cmds.executeBreakpointCustomCommands(t)
 }
 
 func (t *Term) longCommandCancel() {
@@ -626,6 +692,102 @@ func (t *Term) longCommandCanceled() bool {
 // RedirectTo redirects the output of this terminal to the specified writer.
 func (t *Term) RedirectTo(w io.Writer) {
 	t.stdout.pw.w = w
+}
+
+func (t *Term) goVersion() *goversion.GoVersion {
+	if t.goVersionCache != nil {
+		return t.goVersionCache
+	}
+	vers := t.client.GetVersion()
+	v := goversion.ParseProducer(vers.TargetGoVersion)
+	t.goVersionCache = &v
+	return t.goVersionCache
+}
+
+func (t *Term) expandPrompt(prompt string) string {
+	const escape = '$'
+	var malformedEscape = []byte("<malformed escape>")
+
+	var hasState bool
+	var pid, tid int
+	var goid int64
+
+	getState := func() {
+		if hasState {
+			return
+		}
+		hasState = true
+		state, err := t.client.GetState()
+		if err != nil {
+			return
+		}
+		pid = state.Pid
+		if state.SelectedGoroutine != nil {
+			goid = state.SelectedGoroutine.ID
+		}
+		if state.CurrentThread != nil {
+			tid = state.CurrentThread.ID
+		}
+	}
+
+	var buf []byte
+	s := 0
+	flush := func(e int) {
+		if s >= len(prompt) {
+			return
+		}
+		if buf == nil {
+			buf = make([]byte, 0, len(prompt))
+		}
+		buf = append(buf, []byte(prompt[s:e])...)
+		s = e
+	}
+	for i := 0; i < len(prompt); i++ {
+		if prompt[i] == escape {
+			flush(i)
+			i++
+			s = i + 1
+			if i >= len(prompt) {
+				buf = append(buf, malformedEscape...)
+				break
+			}
+			switch prompt[i] {
+			case '$':
+				buf = append(buf, '$')
+			case 'd':
+				formatStr := time.RFC3339
+				if i+1 < len(prompt) && prompt[i] == '{' {
+					fs := i + 1
+					for ; i < len(prompt); i++ {
+						if prompt[i] == '}' {
+							break
+						}
+					}
+					formatStr = prompt[fs:i]
+					s = i + 1
+				}
+				buf = append(buf, []byte(time.Now().Format(formatStr))...)
+			case 'f':
+				buf = strconv.AppendInt(buf, int64(t.cmds.frame), 10)
+			case 'g':
+				getState()
+				buf = strconv.AppendInt(buf, goid, 10)
+			case 't':
+				getState()
+				buf = strconv.AppendInt(buf, int64(tid), 10)
+			case 'p':
+				getState()
+				buf = strconv.AppendInt(buf, int64(pid), 10)
+			default:
+				buf = append(buf, malformedEscape...)
+			}
+		}
+	}
+	if buf == nil {
+		return prompt
+	}
+	flush(len(prompt))
+	return string(buf)
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited

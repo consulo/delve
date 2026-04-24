@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -144,6 +145,7 @@ func testDebugLinePrologueParser(p string, t *testing.T) {
 }
 
 func TestUserFile(t *testing.T) {
+	t.Parallel()
 	if userTestFile == "" {
 		return
 	}
@@ -152,6 +154,7 @@ func TestUserFile(t *testing.T) {
 }
 
 func TestDebugLinePrologueParser(t *testing.T) {
+	t.Parallel()
 	// Test against known good values, from readelf --debug-dump=rawline _fixtures/testnextprog
 	p, err := filepath.Abs("../../../_fixtures/testnextprog")
 	if err != nil {
@@ -179,8 +182,7 @@ func BenchmarkLineParser(b *testing.B) {
 
 	data := grabDebugLineSection(p, nil)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ParseAll(data, nil, nil, 0, true, ptrSizeByRuntimeArch())
 	}
 }
@@ -201,9 +203,8 @@ func loadBenchmarkData(tb testing.TB) DebugLines {
 
 func BenchmarkStateMachine(b *testing.B) {
 	lineInfos := loadBenchmarkData(b)
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		sm := newStateMachine(lineInfos[0], lineInfos[0].Instructions, ptrSizeByRuntimeArch())
 
 		for {
@@ -287,6 +288,7 @@ func runTestPCToLine(t testing.TB, lineInfos DebugLines, entries []pctolineEntry
 }
 
 func TestPCToLine(t *testing.T) {
+	t.Parallel()
 	lineInfos := loadBenchmarkData(t)
 
 	entries, basePCs := setupTestPCToLine(t, lineInfos)
@@ -299,13 +301,14 @@ func BenchmarkPCToLine(b *testing.B) {
 	lineInfos := loadBenchmarkData(b)
 
 	entries, basePCs := setupTestPCToLine(b, lineInfos)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		runTestPCToLine(b, lineInfos, entries, basePCs, false, 0x10000)
 	}
 }
 
 func TestDebugLineC(t *testing.T) {
+	t.Parallel()
 	p, err := filepath.Abs("../../../_fixtures/debug_line_c_data")
 	if err != nil {
 		t.Fatal("Could not find test data", p, err)
@@ -331,14 +334,7 @@ func TestDebugLineC(t *testing.T) {
 			t.Fatal("Parser could not parse Filenames")
 		}
 		for _, fn := range ln.FileNames {
-			found := false
-			for _, cmp := range file {
-				if filepath.ToSlash(fn.Path) == cmp {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !slices.Contains(file, filepath.ToSlash(fn.Path)) {
 				t.Fatalf("Found %s does not appear in the filelist\n", fn.Path)
 			}
 		}
@@ -346,6 +342,7 @@ func TestDebugLineC(t *testing.T) {
 }
 
 func TestDebugLineDwarf4(t *testing.T) {
+	t.Parallel()
 	p, err := filepath.Abs("../../../_fixtures/zdebug_line_dwarf4")
 	if err != nil {
 		t.Fatal("Could not find test data", p, err)

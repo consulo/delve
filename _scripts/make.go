@@ -43,17 +43,20 @@ func NewMakeCommands() *cobra.Command {
 		Use:   "build",
 		Short: "Build delve",
 		Run: func(cmd *cobra.Command, args []string) {
-			envflags := []string{}
-			if len(Architecture) > 0 {
-				envflags = append(envflags, "GOARCH="+Architecture)
-			}
-			if len(OS) > 0 {
-				envflags = append(envflags, "GOOS="+OS)
-			}
-			if len(envflags) > 0 {
+			goreleaserPath, _ := exec.LookPath("goreleaser")
+			if len(Architecture) > 0 || len(OS) > 0 || goreleaserPath == "" {
+				// Explicit cross-compile target: fall back to direct go build.
+				envflags := []string{}
+				if len(Architecture) > 0 {
+					envflags = append(envflags, "GOARCH="+Architecture)
+				}
+				if len(OS) > 0 {
+					envflags = append(envflags, "GOOS="+OS)
+				}
 				executeEnv(envflags, "go", "build", "-ldflags", "-extldflags -static", tagFlags(false), buildFlags(), DelveMainPackagePath)
 			} else {
-				execute("go", "build", "-ldflags", "-extldflags -static", tagFlags(false), buildFlags(), DelveMainPackagePath)
+				// Default: goreleaser for consistent local/release builds.
+				execute("goreleaser", "build", "--single-target", "--snapshot", "--clean", "--output", "./dlv")
 			}
 			if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" && canMacnative() && !isCodesigned("./dlv") {
 				codesign("./dlv")
@@ -130,6 +133,9 @@ This option can only be specified if testset is basic or a single package.`)
 }
 
 func checkCert() bool {
+	if os.Getenv("CI") != "" {
+		return true
+	}
 	if os.Getenv("NOCERT") != "" {
 		return false
 	}
@@ -302,9 +308,6 @@ func tagFlags(isTest bool) string {
 		tags = append(tags, mactags)
 	}
 	if isTest {
-		if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-			tags = append(tags, "exp.winarm64")
-		}
 		if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
 			tags = append(tags, "exp.linuxppc64le")
 		}
@@ -528,12 +531,10 @@ func allPackages() []string {
 }
 
 // getBuildSHA will invoke git to return the current SHA of the commit at HEAD.
-// If invoking git has been disabled, it will return an empty string instead.
 func getBuildSHA() (string, error) {
 	if DisableGit {
 		return "", nil
 	}
-
 	buildSHA, err := exec.Command("git", "rev-parse", "HEAD").CombinedOutput()
 	if err != nil {
 		return "", err

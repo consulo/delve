@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -232,7 +233,9 @@ func TestRestart_rebuild(t *testing.T) {
 	// In the original fixture file the env var tested for is SOMEVAR.
 	t.Setenv("SOMEVAR", "bah")
 
-	withTestClient2Extended("testenv", t, 0, [3]string{}, nil, func(c service.Client, f protest.Fixture) {
+	// This test must use `testenv2` and it should be the *only* test that uses it. This is because it will overwrite
+	// the fixture file with new source.
+	withTestClient2Extended("testenv2", t, 0, [3]string{}, nil, func(c service.Client, f protest.Fixture) {
 		<-c.Continue()
 
 		var1, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "x", normalLoadConfig)
@@ -492,6 +495,14 @@ func TestClientServer_clearBreakpoint(t *testing.T) {
 
 		if e, a := 1, countBreakpoints(t, c); e != a {
 			t.Fatalf("Expected breakpoint count %d, got %d", e, a)
+		}
+
+		const nonExistentBreakpointId = 9999
+		if bp.ID != nonExistentBreakpointId {
+			_, err := c.ClearBreakpoint(nonExistentBreakpointId)
+			if err == nil {
+				t.Fatalf("Expected error, got none deleting non-existent breakpoint")
+			}
 		}
 
 		deleted, err := c.ClearBreakpoint(bp.ID)
@@ -795,28 +806,65 @@ func matchFunctions(t *testing.T, funcs []string, expected []string, depth int) 
 func TestTraceFollowCallsCommand(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestClient2("testtracefns", t, func(c service.Client) {
-		depth := 3
-		functions, err := c.ListFunctions("main.A", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected := []string{"main.A", "main.B", "main.C", "main.D"}
-		matchFunctions(t, functions, expected, depth)
+		testCases := []struct {
+			funcName string
+			depth    int
+			expected []string
+		}{
+			{
+				funcName: "main.A",
+				depth:    3,
+				expected: []string{"main.A", "main.B", "main.C", "main.D"},
+			},
+			{
+				funcName: "main.first",
+				depth:    3,
+				expected: []string{"main.first", "main.second"},
+			},
+			{
+				funcName: "main.callme",
+				depth:    4,
+				expected: []string{"main.callme", "main.callme2", "main.callmed", "main.callmee"},
+			},
+			{
+				funcName: "main.F0",
+				depth:    6,
+				expected: []string{"main.F0", "main.F0.func1", "main.F1", "main.F2", "main.F3", "main.F4", "runtime.deferreturn", "runtime.gopanic", "runtime.gorecover"},
+			},
+			{
+				funcName: "main.swap",
+				depth:    3,
+				expected: []string{"main.swap", "main.swap.func1", "runtime.deferreturn"},
+			},
+			{
+				funcName: "main.nestDefer",
+				depth:    7,
+				expected: []string{"main.nestDefer", "runtime.deferreturn", "main.outer", "main.swap", "main.swap.func1"},
+			},
+			{
+				funcName: "main.namedDeferLoop",
+				depth:    3,
+				expected: []string{"main.namedDeferLoop", "runtime.deferreturn", "main.testfunc"},
+			},
+			{
+				funcName: "main.op",
+				depth:    3,
+				expected: []string{"main.formula", "main.op", "main.formula.func1"},
+			},
+			{
+				funcName: "main.dyn",
+				depth:    3,
+				expected: []string{"main.assign", "main.dyn", "main.testfunc"},
+			},
+		}
 
-		functions, err = c.ListFunctions("main.first", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.first", "main.second"}
-		matchFunctions(t, functions, expected, depth)
-
-		depth = 4
-		functions, err = c.ListFunctions("main.callme", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.callme", "main.callme2", "main.callmed", "main.callmee"}
-		matchFunctions(t, functions, expected, depth)
-
-		depth = 6
-		functions, err = c.ListFunctions("main.F0", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.F0", "main.F0.func1", "main.F1", "main.F2", "main.F3", "main.F4", "runtime.deferreturn", "runtime.gopanic", "runtime.gorecover"}
-		matchFunctions(t, functions, expected, depth)
+		for _, tc := range testCases {
+			t.Run(tc.funcName, func(t *testing.T) {
+				functions, err := c.ListFunctions(tc.funcName, tc.depth)
+				assertNoError(err, t, "ListFunctions()")
+				matchFunctions(t, functions, tc.expected, tc.depth)
+			})
+		}
 	})
 }
 
@@ -1252,7 +1300,7 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 		assertNoError(err, t, "GoroutinesInfo()")
 		found := make([]bool, 10)
 		for _, g := range gs {
-			frames, err := c.Stacktrace(g.ID, 40, 0, &normalLoadConfig)
+			frames, err := c.Stacktrace(g.ID, 40, 0, 0, &normalLoadConfig)
 			assertNoError(err, t, fmt.Sprintf("Stacktrace(%d)", g.ID))
 			t.Logf("goroutine %d", g.ID)
 			for i, frame := range frames {
@@ -1293,7 +1341,7 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 			t.Fatalf("Continue(): %v\n", state.Err)
 		}
 
-		frames, err := c.Stacktrace(-1, 10, 0, &normalLoadConfig)
+		frames, err := c.Stacktrace(-1, 10, 0, 0, &normalLoadConfig)
 		assertNoError(err, t, "Stacktrace")
 
 		cur := 3
@@ -1314,6 +1362,12 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 			if cur < 0 {
 				break
 			}
+		}
+
+		framesWithSkip, err := c.Stacktrace(-1, 10, len(frames)-1, 0, nil)
+		assertNoError(err, t, "Stacktrace")
+		if len(framesWithSkip) != 1 {
+			t.Errorf("wrong number of frames returned with skip parameter: %d\n", len(framesWithSkip))
 		}
 	})
 }
@@ -1376,7 +1430,7 @@ func TestIssue355(t *testing.T) {
 		assertError(err, t, "ListScopeRegisters()")
 		_, _, err = c.ListGoroutines(0, 0)
 		assertError(err, t, "ListGoroutines()")
-		_, err = c.Stacktrace(gid, 10, 0, &normalLoadConfig)
+		_, err = c.Stacktrace(gid, 10, 0, 0, &normalLoadConfig)
 		assertError(err, t, "Stacktrace()")
 		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1", false, nil)
 		assertError(err, t, "FindLocation()")
@@ -1512,7 +1566,7 @@ func TestNegativeStackDepthBug(t *testing.T) {
 		ch := c.Continue()
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
-		_, err = c.Stacktrace(-1, -2, 0, &normalLoadConfig)
+		_, err = c.Stacktrace(-1, -2, 0, 0, &normalLoadConfig)
 		assertError(err, t, "Stacktrace()")
 	})
 }
@@ -1635,14 +1689,7 @@ func TestTypesCommand(t *testing.T) {
 		types, err := c.ListTypes("")
 		assertNoError(err, t, "ListTypes()")
 
-		found := false
-		for i := range types {
-			if types[i] == "main.astruct" {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(types, "main.astruct") {
 			t.Fatal("Type astruct not found in ListTypes output")
 		}
 
@@ -1666,7 +1713,7 @@ func TestIssue406(t *testing.T) {
 		assertNoError(state.Err, t, "Continue()")
 		v, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "cfgtree", normalLoadConfig)
 		assertNoError(err, t, "EvalVariable()")
-		vs := v.MultilineString("", "")
+		vs := v.StringWithOptions("", "", api.PrettyNewlines)
 		t.Logf("cfgtree formats to: %s\n", vs)
 	})
 }
@@ -2256,7 +2303,7 @@ func (c *brokenRPCClient) Detach(kill bool) error {
 	return c.call("Detach", rpc2.DetachIn{Kill: kill}, out)
 }
 
-func (c *brokenRPCClient) call(method string, args, reply interface{}) error {
+func (c *brokenRPCClient) call(method string, args, reply any) error {
 	return c.client.Call("RPCServer."+method, args, reply)
 }
 
@@ -2496,15 +2543,39 @@ func TestDetachLeaveRunning(t *testing.T) {
 	fixture := protest.BuildFixture(t, "testnextnethttp", buildFlags)
 
 	cmd := exec.Command(fixture.Path)
-	cmd.Stdout = os.Stdout
+
+	// Capture stdout to read the port number
+	stdout, err := cmd.StdoutPipe()
+	assertNoError(err, t, "creating stdout pipe")
 	cmd.Stderr = os.Stderr
 	assertNoError(cmd.Start(), t, "starting fixture")
 	defer cmd.Process.Kill()
 
+	// Read the port from stdout
+	var port int
+	var portLine string
+	buf := make([]byte, 256)
+	for {
+		n, err := stdout.Read(buf)
+		if err != nil {
+			t.Fatal("failed to read port from fixture stdout:", err)
+		}
+		portLine += string(buf[:n])
+		if strings.Contains(portLine, "LISTENING:") {
+			parts := strings.Split(portLine, "LISTENING:")
+			if len(parts) > 1 {
+				portStr := strings.TrimSpace(strings.Split(parts[1], "\n")[0])
+				port, err = strconv.Atoi(portStr)
+				assertNoError(err, t, "parsing port number")
+				break
+			}
+		}
+	}
+
 	// wait for testnextnethttp to start listening
 	t0 := time.Now()
 	for {
-		conn, err := net.Dial("tcp", "127.0.0.1:9191")
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			conn.Close()
 			break
@@ -2600,7 +2671,12 @@ func TestGoroutinesGrouping(t *testing.T) {
 	withTestClient2("goroutinegroup", t, func(c service.Client) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue")
-		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{GroupBy: api.GoroutineLabel, GroupByKey: "name", MaxGroupMembers: 5, MaxGroups: 10}, nil)
+		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{
+			GroupBy:         api.GoroutineLabel,
+			GroupByKey:      "name",
+			MaxGroupMembers: 5,
+			MaxGroups:       10,
+		}, nil)
 		assertNoError(err, t, "ListGoroutinesWithFilter (group by label)")
 		t.Logf("%#v\n", ggrp)
 		if len(ggrp) < 5 {
@@ -2671,7 +2747,7 @@ func TestGenericsBreakpoint(t *testing.T) {
 		}
 
 		frame1Line := func() int {
-			frames, err := c.Stacktrace(-1, 10, 0, nil)
+			frames, err := c.Stacktrace(-1, 10, 0, 0, nil)
 			assertNoError(err, t, "Stacktrace")
 			return frames[1].Line
 		}
@@ -2768,7 +2844,7 @@ func TestClientServer_SinglelineStringFormattedWithBigInts(t *testing.T) {
 
 		constvar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "9331634762088972288", normalLoadConfig)
 		assertNoError(err, t, "ErrVariable(9331634762088972288)")
-		out := constvar.SinglelineStringFormatted("%X")
+		out := constvar.StringWithOptions("", "%X", 0)
 		t.Logf("constant: %q\n", out)
 		if out != "8180A06000000000" {
 			t.Errorf("expected \"8180A06000000000\" got %q when printing constant", out)
@@ -2792,7 +2868,7 @@ func TestClientServer_SinglelineStringFormattedWithBigInts(t *testing.T) {
 				t.Errorf("wrong kind for variable %s\n", child.Kind)
 			}
 			out1 := child.SinglelineString()
-			out2 := child.SinglelineStringFormatted("%X")
+			out2 := child.StringWithOptions("", "%X", 0)
 			t.Logf("%q %q\n", out1, out2)
 			if out1 != expected[i*2] {
 				t.Errorf("for child %d expected %s got %s (decimal)", i, expected[i*2], out1)
@@ -2818,6 +2894,7 @@ func TestNonGoDebug(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Error compiling %s: %s\n%s", path, err, out)
 	}
+	protest.AddPathToRemove(path)
 
 	listener, clientConn := service.ListenerPipe()
 	defer listener.Close()
@@ -3060,45 +3137,17 @@ func TestClientServer_breakpointOnFuncWithABIWrapper(t *testing.T) {
 	})
 }
 
-var waitReasonStrings = [...]string{
-	"",
-	"GC assist marking",
-	"IO wait",
-	"chan receive (nil chan)",
-	"chan send (nil chan)",
-	"dumping heap",
-	"garbage collection",
-	"garbage collection scan",
-	"panicwait",
-	"select",
-	"select (no cases)",
-	"GC assist wait",
-	"GC sweep wait",
-	"GC scavenge wait",
-	"chan receive",
-	"chan send",
-	"finalizer wait",
-	"force gc (idle)",
-	"semacquire",
-	"sleep",
-	"sync.Cond.Wait",
-	"timer goroutine (idle)",
-	"trace reader (blocked)",
-	"wait for GC cycle",
-	"GC worker (idle)",
-	"preempted",
-	"debug call",
-}
-
 func TestClientServer_chanGoroutines(t *testing.T) {
 	withTestClient2("changoroutines", t, func(c service.Client) {
+		ver := c.GetVersion()
+		goVer := goversion.ParseProducer(ver.TargetGoVersion)
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
 		countRecvSend := func(gs []*api.Goroutine) (recvq, sendq int) {
 			for _, g := range gs {
-				t.Logf("\tID: %d WaitReason: %s\n", g.ID, waitReasonStrings[g.WaitReason])
-				switch waitReasonStrings[g.WaitReason] {
+				t.Logf("\tID: %d WaitReason: %s\n", g.ID, api.WaitReasonString(&goVer, g.WaitReason))
+				switch api.WaitReasonString(&goVer, g.WaitReason) {
 				case "chan send":
 					sendq++
 				case "chan receive":
@@ -3131,6 +3180,7 @@ func TestNextInstruction(t *testing.T) {
 	withTestClient2("testprog", t, func(c service.Client) {
 		fp := testProgPath(t, "testprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 19})
+		assertNoError(err, t, "CreateBreakpoint()")
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
@@ -3167,6 +3217,9 @@ func TestGuessSubstitutePath(t *testing.T) {
 		// GuessSubstitutePath fail.
 		t.Skip("does not work in TeamCity + tip + linux")
 	}
+	if os.Getenv("CI") != "" && runtime.GOOS == "linux" && runtime.GOARCH == "riscv64" {
+		t.Skip("does not work on the riscv64 builder")
+	}
 
 	slashnorm := func(s string) string {
 		if runtime.GOOS != "windows" {
@@ -3176,9 +3229,7 @@ func TestGuessSubstitutePath(t *testing.T) {
 	}
 
 	guess := func(t *testing.T, goflags string) [][2]string {
-		oldgoflags := os.Getenv("GOFLAGS")
-		os.Setenv("GOFLAGS", goflags)
-		defer os.Setenv("GOFLAGS", oldgoflags)
+		t.Setenv("GOFLAGS", goflags)
 
 		dlvbin := protest.GetDlvBinary(t)
 
@@ -3203,11 +3254,11 @@ func TestGuessSubstitutePath(t *testing.T) {
 
 		switch runtime.GOARCH {
 		case "ppc64le":
-			os.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
+			t.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
 		case "riscv64":
-			os.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
+			t.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
 		case "loong64":
-			os.Setenv("GOFLAGS", "-tags=exp.linuxloong64")
+			t.Setenv("GOFLAGS", "-tags=exp.linuxloong64")
 		}
 
 		gsp, err := client.GuessSubstitutePath()
@@ -3317,8 +3368,20 @@ func TestFollowExecFindLocation(t *testing.T) {
 		_, err := c.CreateBreakpointWithExpr(&api.Breakpoint{File: childFixture.Source, Line: 9}, fmt.Sprintf("%s:%d", childFixture.Source, 9), nil, true)
 		assertNoError(err, t, "CreateBreakpoint(spawnchild.go:9)")
 
+		gotBreakpointMaterialized := false
+		c.SetEventsFn(func(ev *api.Event) {
+			t.Logf("event = %#v", ev)
+			if ev.Kind == api.EventBreakpointMaterialized {
+				gotBreakpointMaterialized = true
+			}
+		})
+
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
+
+		if !gotBreakpointMaterialized {
+			t.Error("did not get a breakpoint materialized event")
+		}
 
 		tgts, err := c.ListTargets()
 		assertNoError(err, t, "ListTargets")
@@ -3342,5 +3405,87 @@ func TestFollowExecFindLocation(t *testing.T) {
 
 		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", fixture.Source, 19), true, nil)
 		assertNoError(err, t, "FindLocation(spawn.go:19)")
+	})
+}
+
+func TestCancelDownload(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	fakedebuginfodDir, _ := filepath.Abs(filepath.Join(protest.FindFixturesDir(), "fake-debuginfod-find"))
+	t.Setenv("PATH", os.ExpandEnv(fakedebuginfodDir+":$PATH"))
+	withTestClient2("cgotest", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main"})
+		assertNoError(err, t, "CreateBreakpoint")
+		eventReceived := false
+		c.SetEventsFn(func(ev *api.Event) {
+			switch ev.Kind {
+			case api.EventBinaryInfoDownload:
+				eventReceived = true
+				t.Logf("download event: %q %q", ev.BinaryInfoDownloadEventDetails.ImagePath, ev.BinaryInfoDownloadEventDetails.Progress)
+				assertNoError(c.CancelDownloads(), t, "CancelDownloads")
+			}
+		})
+		t0 := time.Now()
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+		if !eventReceived {
+			t.Errorf("Download event was not received")
+		}
+		if time.Since(t0) > 3*time.Second {
+			t.Errorf("Continue took to long, we probably couldn't cancel the download")
+		}
+	})
+}
+
+func TestEvalNonunicodeString(t *testing.T) {
+	// Non-unicode strings can not be sent through json encoding without being
+	// altered, check that our workaround works.
+	// See issue #4072.
+	withTestClient2("testvariables2", t, func(c service.Client) {
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+		v, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "string(issue4072)", normalLoadConfig)
+		assertNoError(err, t, "EvalVariable")
+		t.Logf("%s", v.StringWithOptions("", "", api.PrettyNewlines))
+		tgt := string([]byte{116, 121, 112, 101, 32, 84, 32, 115, 116, 114, 117, 99, 116, 32, 123, 12, 12, 9, 255, 102, 108, 100, 99, 111, 109, 255})
+		if v.Value != tgt {
+			t.Errorf("wrong value for string issue4072 expected %q, got %q", tgt, v.Value)
+		}
+	})
+}
+
+func TestTypeInfo(t *testing.T) {
+	withTestClient2("testvariables2", t, func(c service.Client) {
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+
+		info, err := c.TypeInfo("*main.astruct")
+		assertNoError(err, t, "TypeInfo")
+		t.Logf("%#v", info)
+		t.Logf("kind %s size %d", info.Kind.String(), info.Size)
+		if info.Kind != reflect.Pointer {
+			t.Error("wrong kind")
+		}
+		if len(info.Fields) > 0 || len(info.Methods) > 0 {
+			t.Error("expected no fields or methods")
+		}
+
+		info, err = c.TypeInfo("main.astruct")
+		assertNoError(err, t, "TypeInfo")
+		t.Logf("%#v", info)
+		t.Logf("kind %s size %d", info.Kind.String(), info.Size)
+		if len(info.Fields) != 2 {
+			t.Error("wrong number of fields")
+		}
+		if len(info.Methods) < 2 {
+			t.Error("wrong number of methods")
+		}
+		if slices.Index(info.Methods, api.TypeInfoMethod{Name: "main.(*astruct).Error"}) < 0 {
+			t.Error("could not find Error method")
+		}
+		if slices.Index(info.Methods, api.TypeInfoMethod{Name: "main.astruct.NonPointerReceiverMethod"}) < 0 {
+			t.Error("could not find NonPointerReceiverMethod")
+		}
 	})
 }

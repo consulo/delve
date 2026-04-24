@@ -34,7 +34,7 @@ func LoadModuleData(bi *BinaryInfo, mem MemoryReadWriter) ([]ModuleData, error) 
 
 		for _, fieldName := range []string{typesField, etypesField, textField, etextField, nextField, typemapField} {
 			var err error
-			vars[fieldName], err = md.structMember(fieldName)
+			vars[fieldName], err = md.structField(fieldName)
 			if err != nil {
 				return nil, err
 			}
@@ -76,16 +76,4 @@ func findModuleDataForType(mds []ModuleData, typeAddr uint64) *ModuleData {
 		}
 	}
 	return nil
-}
-
-func findModuleDataForImage(mds []ModuleData, so *Image) *ModuleData {
-	var md *ModuleData
-	for i := range mds {
-		if so == nil || mds[i].text > so.StaticBase {
-			if md == nil || mds[i].text < md.text {
-				md = &mds[i]
-			}
-		}
-	}
-	return md
 }

@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/logflags"
 )
 
 // Remove the file at path and issue a warning to stderr if this fails.
 // This can be used to remove the temporary binary generated for the session.
 func Remove(path string) {
 	var err error
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		err = os.Remove(path)
 		// Open files can be removed on Unix, but not on Windows, where there also appears
 		// to be a delay in releasing the binary when the process exits.
@@ -34,14 +35,14 @@ func Remove(path string) {
 
 // GoBuild builds non-test files in 'pkgs' with the specified 'buildflags'
 // and writes the output at 'debugname'.
-func GoBuild(debugname string, pkgs []string, buildflags string) error {
-	args := goBuildArgs(debugname, pkgs, buildflags, false)
+func GoBuild(debugname string, pkgs []string, buildflags any) error {
+	args, _ := goBuildArgs2(debugname, pkgs, buildflags, false)
 	return gocommandRun("build", args...)
 }
 
 // GoBuildCombinedOutput builds non-test files in 'pkgs' with the specified 'buildflags'
 // and writes the output at 'debugname'.
-func GoBuildCombinedOutput(debugname string, pkgs []string, buildflags interface{}) (string, []byte, error) {
+func GoBuildCombinedOutput(debugname string, pkgs []string, buildflags any) (string, []byte, error) {
 	args, err := goBuildArgs2(debugname, pkgs, buildflags, false)
 	if err != nil {
 		return "", nil, err
@@ -51,14 +52,14 @@ func GoBuildCombinedOutput(debugname string, pkgs []string, buildflags interface
 
 // GoTestBuild builds test files 'pkgs' with the specified 'buildflags'
 // and writes the output at 'debugname'.
-func GoTestBuild(debugname string, pkgs []string, buildflags string) error {
-	args := goBuildArgs(debugname, pkgs, buildflags, true)
+func GoTestBuild(debugname string, pkgs []string, buildflags any) error {
+	args, _ := goBuildArgs2(debugname, pkgs, buildflags, true)
 	return gocommandRun("test", args...)
 }
 
 // GoTestBuildCombinedOutput builds test files 'pkgs' with the specified 'buildflags'
 // and writes the output at 'debugname'.
-func GoTestBuildCombinedOutput(debugname string, pkgs []string, buildflags interface{}) (string, []byte, error) {
+func GoTestBuildCombinedOutput(debugname string, pkgs []string, buildflags any) (string, []byte, error) {
 	args, err := goBuildArgs2(debugname, pkgs, buildflags, true)
 	if err != nil {
 		return "", nil, err
@@ -91,7 +92,7 @@ func goBuildArgs(debugname string, pkgs []string, buildflags string, isTest bool
 }
 
 // goBuildArgs2 is like goBuildArgs, but takes either string or []string.
-func goBuildArgs2(debugname string, pkgs []string, buildflags interface{}, isTest bool) ([]string, error) {
+func goBuildArgs2(debugname string, pkgs []string, buildflags any, isTest bool) ([]string, error) {
 	var args []string
 	switch buildflags := buildflags.(type) {
 	case string:
@@ -113,8 +114,8 @@ func goBuildArgs2(debugname string, pkgs []string, buildflags interface{}, isTes
 
 func gocommandRun(command string, args ...string) error {
 	_, goBuild := gocommandExecCmd(command, args...)
-	goBuild.Stderr = os.Stdout
-	goBuild.Stdout = os.Stderr
+	goBuild.Stdout = os.Stdout
+	goBuild.Stderr = os.Stderr
 	return goBuild.Run()
 }
 
@@ -128,5 +129,6 @@ func gocommandExecCmd(command string, args ...string) (string, *exec.Cmd) {
 	allargs := []string{command}
 	allargs = append(allargs, args...)
 	goBuild := exec.Command("go", allargs...)
+	logflags.DebuggerLogger().Debugf("gobuild args: %v", allargs)
 	return strings.Join(append([]string{"go"}, allargs...), " "), goBuild
 }

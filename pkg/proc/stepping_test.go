@@ -35,7 +35,7 @@ const (
 
 type seqTest struct {
 	cf  contFunc
-	pos interface{}
+	pos any
 }
 
 func testseq(program string, contFunc contFunc, testcases []nextTest, initialLocation string, t *testing.T) {
@@ -659,10 +659,6 @@ func TestNextGenericMethodThroughInterface(t *testing.T) {
 }
 
 func TestRangeOverFuncNext(t *testing.T) {
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("N/A")
-	}
-
 	var bp *proc.Breakpoint
 
 	funcBreak := func(t *testing.T, fnname string) seqTest {
@@ -693,6 +689,15 @@ func TestRangeOverFuncNext(t *testing.T) {
 
 	nx := func(n int) seqTest {
 		return seqTest{contNext, n}
+	}
+
+	nop := seqTest{contNothing, func(*proc.Target) {}}
+
+	ifcond := func(v bool, a seqTest, b seqTest) seqTest {
+		if v {
+			return a
+		}
+		return b
 	}
 
 	assertLocals := func(t *testing.T, varnames ...string) seqTest {
@@ -767,7 +772,7 @@ func TestRangeOverFuncNext(t *testing.T) {
 			testseq2intl(t, fixture, grp, p, nil, []seqTest{
 				funcBreak(t, "main.TestTrickyIterAll"),
 				{contContinue, 24}, // TestTrickyIterAll
-				nx(25),
+				ifcond(runtime.GOARCH == "arm64" && goversion.VersionAfterOrEqual(runtime.Version(), 1, 25), nop, nx(25)),
 				nx(26),
 				nx(27), // for _, x := range ...
 				assertLocals(t, "trickItAll", "i"),
@@ -796,7 +801,7 @@ func TestRangeOverFuncNext(t *testing.T) {
 			testseq2intl(t, fixture, grp, p, nil, []seqTest{
 				funcBreak(t, "main.TestTrickyIterAll2"),
 				{contContinue, 37}, // TestTrickyIterAll2
-				nx(38),
+				ifcond(runtime.GOARCH == "arm64" && goversion.VersionAfterOrEqual(runtime.Version(), 1, 25), nop, nx(38)),
 				nx(39),
 				nx(40), // for _, x := range...
 				nx(41),
@@ -1204,10 +1209,6 @@ func TestRangeOverFuncNext(t *testing.T) {
 }
 
 func TestRangeOverFuncStepOut(t *testing.T) {
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("N/A")
-	}
-
 	testseq2(t, "rangeoverfunc", "", []seqTest{
 		{contContinue, 97},
 		{contStepout, 251},
@@ -1215,10 +1216,9 @@ func TestRangeOverFuncStepOut(t *testing.T) {
 }
 
 func TestRangeOverFuncNextInlined(t *testing.T) {
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("N/A")
-	}
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) && !goversion.VersionAfterOrEqual(runtime.Version(), 1, 25) {
+	// See #3882: inlined range-over-func produces symbol names that Delve
+	// cannot correlate; requires a compiler fix that has not landed yet.
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
 		t.Skip("broken due to inlined symbol names")
 	}
 
@@ -1767,9 +1767,6 @@ func TestRangeOverFuncNextInlined(t *testing.T) {
 }
 
 func TestStepIntoCoroutine(t *testing.T) {
-	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 23) {
-		t.Skip("N/A")
-	}
 	skipOn(t, "not working due to optimizations", "386")
 	withTestProcessArgs("backwardsiter", t, ".", []string{}, 0, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		testseq2intl(t, fixture, grp, p, nil, []seqTest{

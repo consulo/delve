@@ -3,6 +3,194 @@
 All notable changes to this project will be documented in this file.
 This project adheres to Semantic Versioning.
 
+## [1.26.2] 2026-04-20
+
+### Added
+
+- Gorelease release automation (#4278, #4286, @derekparker)
+- Configuration for the command line prompt (#4284, @aarzilli)
+- DAP console command port of `examinemem` (#4289, @BrotifyPacha)
+- Support for data breakpoints in DAP (#4294, @aarzilli)
+- Extended `whatis` command to types (#4291, @aarzilli)
+- Added verbosity level for trace command (#4251, @archanaravindar)
+
+### Fixed
+
+- Stacktraces are now cached for better performance (#4277, @aarzilli)
+- Evaluation of DW_OP_shr and DW_OP_shra (#4296, @cuiweixie)
+- Stack-out-of-scope breakpoint setting for reversed execution (#4295, @cuiweixie)
+- Miscellaneous fixes (#4298, #4297, #4292, #4304, @cuiweixie, @aarzilli, @typesanitizer)
+
+### Changed
+
+- DAP server now sets sequence numbers for responses (#4280, @aarzilli)
+- DAP server now prints message before building the target program (#4287, @aarzilli)
+- Extended eBPF tracing support to more types (#4285, @derekparker)
+- Better documentation (#4282, @aarzilli)
+
+## [1.26.1] 2026-03-03
+
+### Added
+
+- Support for debugging stripped non-Go binaries (#4263, @derekparker)
+- Package for detecting debugger attachment (#4258, @derekparker)
+- Starlark `append_file` built-in function (#4252, @sding3)
+- DAP: Hit conditional breakpoint capability (#4230, @DrSergei)
+- Detection and warning about trimpath (#4241, @aarzilli)
+
+### Fixed
+
+- Fix debuginfod download progress (#4270, @aarzilli)
+- Fix sigpanics in swiss map iterator (#4261, @derekparker)
+- Fix finding moduledata in Go 1.26+ (#4228, @derekparker)
+- Fix goroutine leak and shutdown sequence for eBPF backend (#4231, @derekparker)
+- Fix eBPF uprobe placement to skip function prologue (#4249, @derekparker)
+- Fix `ProducerAfterOrEqual` comparison for devel builds (#4234, @typesanitizer)
+- DAP: Better error messages when debugger can't be launched (#4264, @aarzilli)
+- DAP: Reject most requests before launch/attach (#4240, @aarzilli)
+- Propagate short type option when printing structs (#4235, @igadmg)
+- Better error if process is already being debugged (#4242, @aarzilli)
+- Print error when request body can't be decoded (#4247, @aarzilli)
+- Parse rc version with trailing suffix (#4255, @alexsaezm)
+
+### Changed
+
+- Migrate from gopkg.in/yaml.v3 to go.yaml.in/yaml/v3 (#4257, @scop)
+- Update waitReason switch for Go 1.27 (#4244, @typesanitizer)
+- Downgrade riscv64 support (#4232, @derekparker)
+- Miscellaneous code quality improvements (#4221, #4226, #4259, #4262, #4224, @derekparker, @aarzilli)
+- Miscellaneous improvements to tests, documentation, and build configuration (#4250, #4254, #4248, #4265, @derekparker, @aarzilli, @stack1ng)
+
+## [1.26.0] 2025-12-18
+
+### Added
+
+- Go 1.26 support (#4211, #4205, #4212, #4217, @aarzilli)
+- Savestate command for terminal (#4045, @alexsaezm)
+- DAP: Target command and follow-exec support (#4078, @Lslightly)
+- DAP: Read memory request handler (#4083, @MistaTwista)
+- DAP: Input/output redirection (#4178, @aarzilli)
+- DAP: Suspended breakpoints support (#4075, @firelizzard18)
+- DAP: Use exception breakpoints for predefined breakpoints (#4169, @aarzilli)
+- Custom starlark commands can be used with on prefix (#4170, @derekparker)
+- Shortcut syntax to access target variables in starlark (#4134, @aarzilli)
+- Support for tracing defer function calls with follow option (#3978, @archanaravindar)
+- Flag to retain trace directory after detach (#4091, @archanaravindar)
+- Ability to cancel debuginfod downloads (#4123, @aarzilli)
+- Process spawned event (#4171, @firelizzard18)
+- Materialized breakpoint event for follow-exec mode (#4161, @aarzilli)
+- Way to disable stop-on-error for breakpoint conditions (#4191, @aarzilli)
+- Function call support on loong64 (#4114, @yelvens)
+- Build argument logging (#4185, @pedia)
+- Capslock check (#4106, @derekparker)
+
+### Fixed
+
+- DAP: Restart handling when compilation fails (#4215, @aarzilli)
+- DAP: Disable string() field for address-less variables (#4214, @aarzilli)
+- DAP: Race condition in tests (#4121, @derekparker)
+- Gdbserial: Do not set detached if we kill the process (#4216, @aarzilli)
+- Prevent trace killing attached process (#4164, @alex-emery)
+- Trace /regexp/ should set ret breakpoints correctly (#4130, @aarzilli)
+- Replay subcommand must keep trace directory (#4184, @lwintermelon)
+- Nil pointer dereference when calling extra on a nil func (#4174, @aarzilli)
+- Check that breakpoint exists in ClearBreakpoint (#4141, @aarzilli)
+- Use address in ClearBreakpoint only when ID is 0 (#4168, @aarzilli)
+- Return error when calling a non-ptr receiver method on a nil ptr (#4139, @aarzilli)
+- Additional checks parsing g structs (#4140, @aarzilli)
+- Remember that we attached in WaitFor attach mode (#4120, @aarzilli)
+- Guard register logging from nil pointer dereferences (#4188, @aarzilli)
+- Do not insist stmt is same line as entry in DWARF (#4186, @derekparker)
+- Fix wait reason string table (#4182, @aarzilli)
+- Workaround for non-unicode strings in Variables (#4082, @aarzilli)
+- Fix ppc64le clause in support_sentinel_linux.go (#4129, @tshah14)
+- Improve frame unwind context handling on loong64 (#4133, @yelvens)
+
+### Changed
+
+- Replace hashicorp/golang-lru with custom lru cache (#4196, @qmuntal)
+- Update riscv64 support and add to test matrix (#4190, @lrzlin)
+- Update riscv64 capslock file (#4210, @derekparker)
+- Move things that use x/tools/go/packages to new repo (#3990, @aarzilli)
+- Remove experimental build tags for Windows ARM64 (#4176, @gdams)
+- Add Windows ARM64 workflow to CI (#4175, @gdams)
+- Add linux/loong64 to TeamCity configuration (#4154, @yelvens)
+- Set CI=true on a project level (#4156, @vietage)
+- Hierarchical search for structMember or method (#4118, @wenxuan70)
+- Update trie to v3.2.0 (#4131, @derekparker)
+- Parallelize tests where possible (#4115, @derekparker)
+- Modernize codebase with newer syntax and helpers (#4110, @derekparker)
+- Miscellaneous improvements to tests and build configuration (#4096, #4135, #4145, #4157, #4163, #4198, #4202, #4111, #4122, #4124, #4209, @derekparker, @aarzilli)
+- Miscellaneous code refactoring (#4159, #4173, #4201, @aarzilli)
+
+## [1.25.2] 2025-08-26
+
+### Added
+
+* Added notifications for debuginfod downloads (#3980, @aarzilli)
+
+### Fixed
+
+* Fixed restart behavior of DAP server (#4068, @derekparker)
+* Various fixes for loong64 backend (#4095, #4100, @yelvens)
+* Miscellaneous minor bug fixes (#4067, #4090, #4089, @aarzilli)
+
+### Changed
+
+* Miscellaneous code quality improvements (#4088, @cui)
+
+## [1.25.1] 2025-07-18
+
+### Added
+- Implement restart request for DAP (#4057, @derekparker)
+
+### Fixed
+- Fixed panic when trying to stacktrace an unreadable goroutine in DAP (#4056, @aarzilli)
+- Fixed panic when trying to access value of unreadable string variables in DAP (#4055, @aarzilli)
+- Fixed type cast between slices with the same element type (#4048, @aarzilli)
+- Fixed closure captured variables visibility on closure's first line (#4049, @aarzilli)
+- Fixed unknown DWARF opcodes causing panics (#4037, @aarzilli)
+- Added missing response body close in DAP test (#4039, @alexandear)
+- Fix panic in switchToGoroutineStacktrace (#4043, @derekparker)
+
+### Changed
+- Handle moving of direct interface flag in Go 1.26 (#4032, @randall77)
+- Simplified tests using slices.Contains (#4040, @alexandear)
+- Updated Go max support minor version and update golang.org/x/tools (#4046, @derekparker)
+
+## [1.25.0] 2025-04-16
+
+### Added
+- Go 1.25 support (#4014, @aarzilli) (more work went into the 1.24.2 and earlier releases)
+
+### Fixed
+- Fixed several panics found via telemetry (#4026, #4018, #4017, #4015 @aarzilli)
+- Fixed git hash in version output (#3987, @codeaucafe)
+- Fix development version parsing (#3999, @aarzilli)
+- Fix call injection in newer macOS versions (#3988, @aarzilli)
+- Fix typo in goroutines help output (#4024, @jersey1dev)
+
+### Changed
+- Internal breakpoints (panic, throw) are excluded from DAP response (#4027, @ConradIrwin)
+
+## [1.24.2] 2025-04-10
+
+### Added
+
+- Support for struct literals in expression evaluator (#3935, #3953, @aarzilli)
+- Check to reject DWARFv5 executables if delve itself isn't built with 1.25 or later due to bugs in Go's standard library prior to 1.25 (#3943, #3961, @aarzilli)
+
+### Fixed
+
+- Support for macOS Sequoia 15.4 (#3966, @aarzilli)
+- Race conditions with rr backend (#3971, #3973, #3963, @BronzeDeer, @aarzilli)
+- Goroutine load with corrupted label maps (#3968, #3962, @hongyuh-hh)
+- Breakpoint conditions on suspended breakpoints (#3938, @Lslightly)
+
+### Changed
+
+- Miscellaneous test and documentation fixes (#3979, #3952, #3954, #3955, #3951, @alexandear, @codesoap, @derekparker)
+
 ## [1.24.1] 2025-03-05
 
 ### Added

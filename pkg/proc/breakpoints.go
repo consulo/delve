@@ -113,6 +113,11 @@ type Breaklet struct {
 	watchpoint *Breakpoint
 }
 
+// SetCallback sets the call back field, this was primarily added to prevent exporting callback field
+func (b *Breaklet) SetCallback(callback func(th Thread, p *Target) (bool, error)) {
+	b.callback = callback
+}
+
 // BreakpointKind determines the behavior of delve when the
 // breakpoint is reached.
 type BreakpointKind uint16
@@ -153,6 +158,10 @@ const (
 	NextInactivatedBreakpoint
 
 	StepIntoRangeOverFuncBodyBreakpoint
+
+	// SharedLibBreakpoint is a breakpoint set at the dynamic linker's r_brk
+	// notification function to detect shared library loading/unloading.
+	SharedLibBreakpoint
 
 	steppingMask = NextBreakpoint | NextDeferBreakpoint | StepBreakpoint | StepIntoNewProcBreakpoint | NextInactivatedBreakpoint | StepIntoRangeOverFuncBodyBreakpoint
 )
@@ -235,6 +244,8 @@ func (bp *Breakpoint) VerboseDescr() []string {
 			r = append(r, "NextInactivatedBreakpoint")
 		case StepIntoRangeOverFuncBodyBreakpoint:
 			r = append(r, "StepIntoRangeOverFuncBodyBreakpoint Cond=%q", astutil.ExprToString(breaklet.Cond))
+		case SharedLibBreakpoint:
+			r = append(r, "SharedLibBreakpoint")
 		default:
 			r = append(r, fmt.Sprintf("Unknown %d", breaklet.Kind))
 		}
@@ -328,7 +339,7 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 			}
 		}
 
-	case StackResizeBreakpoint, PluginOpenBreakpoint, StepIntoNewProcBreakpoint, StepIntoRangeOverFuncBodyBreakpoint:
+	case StackResizeBreakpoint, PluginOpenBreakpoint, StepIntoNewProcBreakpoint, StepIntoRangeOverFuncBodyBreakpoint, SharedLibBreakpoint:
 		// no further checks
 
 	case NextInactivatedBreakpoint:
@@ -455,6 +466,16 @@ func (bp *Breakpoint) IsUser() bool {
 	return false
 }
 
+// IsSharedLibBreakpoint returns true if this breakpoint has a SharedLibBreakpoint breaklet.
+func (bp *Breakpoint) IsSharedLibBreakpoint() bool {
+	for _, breaklet := range bp.Breaklets {
+		if breaklet.Kind == SharedLibBreakpoint {
+			return true
+		}
+	}
+	return false
+}
+
 // UserBreaklet returns the user breaklet for this breakpoint, or nil if
 // none exist.
 func (bp *Breakpoint) UserBreaklet() *Breaklet {
@@ -477,15 +498,32 @@ func evalBreakpointCondition(tgt *Target, thread Thread, cond ast.Expr) (bool, e
 			return true, err
 		}
 	}
-	v, err := scope.evalAST(cond)
+	flags := scope.evalopFlags()
+	flags |= evalop.BreakpointCondition
+	ops, err := evalop.CompileAST(scopeToEvalLookup{scope}, cond, flags)
 	if err != nil {
+		return true, err
+	}
+	stack := &evalStack{}
+	stack.eval(scope, ops)
+	v, err := stack.result(nil)
+	if err != nil {
+		if stack.disabledErrors {
+			return false, nil
+		}
 		return true, fmt.Errorf("error evaluating expression: %v", err)
 	}
 	if v.Kind != reflect.Bool {
+		if stack.disabledErrors {
+			return false, nil
+		}
 		return true, errors.New("condition expression not boolean")
 	}
 	v.loadValue(loadFullValue)
 	if v.Unreadable != nil {
+		if stack.disabledErrors {
+			return false, nil
+		}
 		return true, fmt.Errorf("condition expression unreadable: %v", v.Unreadable)
 	}
 	return constant.BoolVal(v.Value), nil
@@ -589,7 +627,7 @@ func (t *Target) setEBPFTracepointOnFunc(fn *Function, goidOffset int64) error {
 	var args []ebpf.UProbeArgMap
 	varEntries := reader.Variables(dwarfTree, fn.Entry, l, variablesFlags)
 	for _, entry := range varEntries {
-		_, dt, err := readVarEntry(entry.Tree, fn.cu.image)
+		name, dt, err := readVarEntry(entry.Tree, fn.cu.image)
 		if err != nil {
 			return err
 		}
@@ -607,9 +645,11 @@ func (t *Target) setEBPFTracepointOnFunc(fn *Function, goidOffset int64) error {
 		isret, _ := entry.Val(dwarf.AttrVarParam).(bool)
 		offset += int64(t.BinInfo().Arch.PtrSize())
 		args = append(args, ebpf.UProbeArgMap{
+			Name: name,
 			Offset: offset,
 			Size:   dt.Size(),
 			Kind:   dt.Common().ReflectKind,
+			TypeName: dt.String(),
 			Pieces: paramPieces,
 			InReg:  len(pieces) > 0,
 			Ret:    isret,
@@ -1014,11 +1054,11 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 
 	g, err := GetG(thread)
 	if err != nil {
-		return returnInfoError("could not get g", err, thread.ProcessMemory())
+		return returnInfoError("could not get g", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	scope, err := GoroutineScope(t, thread)
 	if err != nil {
-		return returnInfoError("could not get scope", err, thread.ProcessMemory())
+		return returnInfoError("could not get scope", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	v, err := scope.evalAST(rbpi.retFrameCond)
 	if err != nil || v.Unreadable != nil || v.Kind != reflect.Bool {
@@ -1036,12 +1076,12 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 	oldSP := uint64(rbpi.spOffset + int64(g.stack.hi))
 	err = fakeFunctionEntryScope(scope, rbpi.fn, oldFrameOffset, oldSP)
 	if err != nil {
-		return returnInfoError("could not read function entry", err, thread.ProcessMemory())
+		return returnInfoError("could not read function entry", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 
-	vars, err := scope.Locals(0, "")
+	vars, err := scope.Locals(localsFakeFunctionEntryScope, "")
 	if err != nil {
-		return returnInfoError("could not evaluate return variables", err, thread.ProcessMemory())
+		return returnInfoError("could not evaluate return variables", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	vars = filterVariables(vars, func(v *Variable) bool {
 		return (v.Flags & VariableReturnArgument) != 0
@@ -1050,8 +1090,8 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 	return vars
 }
 
-func returnInfoError(descr string, err error, mem MemoryReadWriter) []*Variable {
-	v := newConstant(constant.MakeString(fmt.Sprintf("%s: %v", descr, err.Error())), mem)
+func returnInfoError(descr string, err error, bi *BinaryInfo, mem MemoryReadWriter) []*Variable {
+	v := newConstant(constant.MakeString(fmt.Sprintf("%s: %v", descr, err.Error())), bi, mem)
 	v.Name = "return value read error"
 	return []*Variable{v}
 }
@@ -1085,6 +1125,8 @@ type LogicalBreakpoint struct {
 	LoadArgs    *LoadConfig
 	LoadLocals  *LoadConfig
 
+	CustomCommands []string // Custom starlark commands to execute when the breakpoint is hit
+
 	HitCount      map[int64]uint64 // Number of times a breakpoint has been reached in a certain goroutine
 	TotalHitCount uint64           // Number of times a breakpoint has been reached
 	HitCondPerG   bool             // Use per goroutine hitcount as HitCond operand, instead of total hitcount
@@ -1104,7 +1146,7 @@ type LogicalBreakpoint struct {
 	// condUsesHitCounts is true when 'cond' uses breakpoint hitcounts
 	condUsesHitCounts bool
 
-	UserData interface{} // Any additional information about the breakpoint
+	UserData any // Any additional information about the breakpoint
 	// Name of root function from where tracing needs to be done
 	RootFuncName string
 	// depth of tracing
@@ -1181,7 +1223,7 @@ func breakpointConditionSatisfiable(lbpmap map[int]*LogicalBreakpoint, lbp *Logi
 			return 0, false
 		}
 		ident, ok := selx.X.(*ast.Ident)
-		if !ok || ident.Name != evalop.BreakpointHitCountVarNamePackage || selx.Sel.Name != evalop.BreakpointHitCountVarName {
+		if !ok || ident.Name != evalop.DelvePackage || selx.Sel.Name != evalop.BreakpointHitCountVarName {
 			return 0, false
 		}
 		lit, ok := idx.Index.(*ast.BasicLit)
@@ -1267,7 +1309,7 @@ func breakpointConditionUsesHitCounts(lbp *LogicalBreakpoint) bool {
 		if ok {
 			ident, ok := seln.X.(*ast.Ident)
 			if ok {
-				if ident.Name == evalop.BreakpointHitCountVarNamePackage && seln.Sel.Name == evalop.BreakpointHitCountVarName {
+				if ident.Name == evalop.DelvePackage && seln.Sel.Name == evalop.BreakpointHitCountVarName {
 					r = true
 					return false
 				}

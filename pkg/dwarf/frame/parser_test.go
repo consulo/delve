@@ -9,6 +9,7 @@ import (
 )
 
 func TestParseCIE(t *testing.T) {
+	t.Parallel()
 	ctx := &parseContext{
 		buf:    bytes.NewBuffer([]byte{3, 0, 1, 124, 16, 12, 7, 8, 5, 16, 2, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 16, 64, 0, 0, 0, 0, 0}),
 		common: &CommonInformationEntry{Length: 12},
@@ -52,8 +53,7 @@ func BenchmarkParse(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		Parse(data, binary.BigEndian, 0, ptrSizeByRuntimeArch(), 0)
 	}
 }

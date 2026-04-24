@@ -21,6 +21,7 @@ dlv debug [package] [flags]
       --continue        Continue the debugged process on start.
   -h, --help            help for debug
       --output string   Output path for the binary.
+      --rr-cleanup      Delete directory containing debug recording on detach. (default true)
       --tty string      TTY to use for the target program
 ```
 

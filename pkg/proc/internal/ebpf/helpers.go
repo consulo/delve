@@ -3,9 +3,11 @@
 package ebpf
 
 import (
+	"context"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
 	"sync"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -63,15 +66,31 @@ type EBPFContext struct {
 	links      []link.Link
 
 	parsedBpfEvents []RawUProbeParams
+	argTypeInfo     map[uint64][]UProbeArgMap // Maps function address to argument type information
 	m               sync.Mutex
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func (ctx *EBPFContext) Close() {
-	if ctx.objs != nil {
-		ctx.objs.Close()
+	if ctx.cancel != nil {
+		ctx.cancel()
 	}
+
+	if ctx.bpfRingBuf != nil {
+		ctx.bpfRingBuf.Close()
+	}
+
+	ctx.wg.Wait()
+
 	for _, l := range ctx.links {
 		l.Close()
+	}
+
+	if ctx.objs != nil {
+		ctx.objs.Close()
 	}
 }
 
@@ -90,6 +109,15 @@ func (ctx *EBPFContext) UpdateArgMap(key uint64, goidOffset int64, args []UProbe
 	}
 	params := createFunctionParameterList(key, goidOffset, args, isret)
 	params.g_addr_offset = gAddrOffset
+
+	// Store argument type information for later use when parsing results
+	ctx.m.Lock()
+	if ctx.argTypeInfo == nil {
+		ctx.argTypeInfo = make(map[uint64][]UProbeArgMap)
+	}
+	ctx.argTypeInfo[key] = args
+	ctx.m.Unlock()
+
 	return ctx.bpfArgMap.Update(unsafe.Pointer(&key), unsafe.Pointer(&params), ebpf.UpdateAny)
 }
 
@@ -115,7 +143,7 @@ func LoadEBPFTracingProgram(path string) (*EBPFContext, error) {
 	)
 
 	if err = rlimit.RemoveMemlock(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to remove memlock limit (try running with CAP_SYS_RESOURCE or as root): %w", err)
 	}
 	ctx.executable, err = link.OpenExecutable(path)
 	if err != nil {
@@ -134,26 +162,39 @@ func LoadEBPFTracingProgram(path string) (*EBPFContext, error) {
 
 	ctx.bpfArgMap = objs.ArgMap
 
-	// TODO(derekparker): This should eventually be moved to a more generalized place.
-	go func() {
-		for {
+	ctx.ctx, ctx.cancel = context.WithCancel(context.Background())
+
+	ctx.wg.Add(1)
+	go ctx.pollEvents()
+
+	return &ctx, nil
+}
+
+// pollEvents reads events from the ring buffer and stores them for retrieval.
+// This goroutine runs until the context is cancelled.
+func (ctx *EBPFContext) pollEvents() {
+	defer ctx.wg.Done()
+
+	for {
+		select {
+		case <-ctx.ctx.Done():
+			return
+		default:
 			e, err := ctx.bpfRingBuf.Read()
-			if err != nil {
+			if err != nil || ctx.ctx.Err() != nil {
 				return
 			}
 
-			parsed := parseFunctionParameterList(e.RawSample)
+			parsed := parseFunctionParameterList(ctx, e.RawSample)
 
 			ctx.m.Lock()
 			ctx.parsedBpfEvents = append(ctx.parsedBpfEvents, parsed)
 			ctx.m.Unlock()
 		}
-	}()
-
-	return &ctx, nil
+	}
 }
 
-func parseFunctionParameterList(rawParamBytes []byte) RawUProbeParams {
+func parseFunctionParameterList(ctx *EBPFContext, rawParamBytes []byte) RawUProbeParams {
 	params := (*function_parameter_list_t)(unsafe.Pointer(&rawParamBytes[0]))
 
 	defer runtime.KeepAlive(params) // Ensure the param is not garbage collected.
@@ -163,11 +204,22 @@ func parseFunctionParameterList(rawParamBytes []byte) RawUProbeParams {
 	rawParams.GoroutineID = int(params.goroutine_id)
 	rawParams.IsRet = params.is_ret
 
-	parseParam := func(param function_parameter_t) *RawUProbeParam {
+	// Look up original type information for this function
+	ctx.m.Lock()
+	argTypes := ctx.argTypeInfo[params.fn_addr]
+	ctx.m.Unlock()
+
+	parseParam := func(param function_parameter_t, paramIdx int) *RawUProbeParam {
 		iparam := &RawUProbeParam{}
 		data := make([]byte, 0x60)
 		ret := param
 		iparam.Kind = reflect.Kind(ret.kind)
+
+		// Populate name and type name from argTypes if available
+		if paramIdx < len(argTypes) {
+			iparam.Name = argTypes[paramIdx].Name
+			iparam.TypeName = argTypes[paramIdx].TypeName
+		}
 
 		val := ret.val[:ret.size]
 		rawDerefValue := ret.deref_val[:0x30]
@@ -184,25 +236,90 @@ func parseFunctionParameterList(rawParamBytes []byte) RawUProbeParams {
 
 		switch iparam.Kind {
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			iparam.RealType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8}}}
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Bool:
-			iparam.RealType = &godwarf.IntType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8}}}
+			iparam.RealType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(ret.size), Name: iparam.Kind.String(), ReflectKind: iparam.Kind}}}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			iparam.RealType = &godwarf.IntType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(ret.size), Name: iparam.Kind.String(), ReflectKind: iparam.Kind}}}
+		case reflect.Bool:
+			iparam.RealType = &godwarf.BoolType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 1, Name: "bool", ReflectKind: reflect.Bool}}}
+		case reflect.Float32, reflect.Float64:
+			if !usesXMMRegisters(ret) {
+				iparam.RealType = &godwarf.FloatType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(ret.size), Name: iparam.Kind.String(), ReflectKind: iparam.Kind}}}
+			}
+			// If in XMM registers, RealType stays nil, marked unreadable in target.go
+		case reflect.Complex64, reflect.Complex128:
+			if !usesXMMRegisters(ret) {
+				iparam.RealType = &godwarf.ComplexType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(ret.size), Name: iparam.Kind.String(), ReflectKind: iparam.Kind}}}
+			}
+		case reflect.Ptr, reflect.UnsafePointer:
+			// Display the raw pointer address as a uintptr value.
+			// The eBPF probe captures dereferenced data into deref_val
+			// (up to 0x30 bytes), but we can't use it here because:
+			// 1) loadPtr needs the element type, which isn't propagated
+			//    through the eBPF pipeline (only Kind and Size are sent)
+			// 2) deref_val is limited to 48 bytes, insufficient for
+			//    nested or variable-length pointed-to types
+			iparam.Kind = reflect.Uintptr
+			iparam.RealType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: int64(ret.size), Name: "uintptr", ReflectKind: reflect.Uintptr}}}
+		case reflect.Slice:
+			// Display the slice data pointer address as a uintptr value.
+			// Same limitations as pointers above: element type info is
+			// not available, and deref_val (48 bytes) can only hold a
+			// few elements.
+			iparam.Kind = reflect.Uintptr
+			iparam.RealType = &godwarf.UintType{BasicType: godwarf.BasicType{CommonType: godwarf.CommonType{ByteSize: 8, Name: "uintptr", ReflectKind: reflect.Uintptr}}}
 		case reflect.String:
 			strLen := binary.LittleEndian.Uint64(val[8:])
 			iparam.Base = FakeAddressBase + 0x30
 			iparam.Len = int64(strLen)
+			iparam.RealType = &godwarf.StringType{
+				StructType: godwarf.StructType{
+					CommonType: godwarf.CommonType{
+						ByteSize:    16,
+						Name:        "string",
+						ReflectKind: reflect.String,
+					},
+					Kind: "struct",
+				},
+			}
+		case reflect.Map:
+			iparam.Unreadable = fmt.Errorf("map type not yet supported by ebpf tracing")
+		case reflect.Chan:
+			iparam.Unreadable = fmt.Errorf("chan type not yet supported by ebpf tracing")
+		case reflect.Interface:
+			iparam.Unreadable = fmt.Errorf("interface type not yet supported by ebpf tracing")
+		case reflect.Func:
+			iparam.Unreadable = fmt.Errorf("func type not yet supported by ebpf tracing")
+		case reflect.Struct:
+			iparam.Unreadable = fmt.Errorf("struct type not yet supported by ebpf tracing")
+		case reflect.Array:
+			iparam.Unreadable = fmt.Errorf("array type not yet supported by ebpf tracing")
 		}
 		return iparam
 	}
 
 	for i := 0; i < int(params.n_parameters); i++ {
-		rawParams.InputParams = append(rawParams.InputParams, parseParam(params.params[i]))
+		rawParams.InputParams = append(rawParams.InputParams, parseParam(params.params[i], i))
 	}
+	// Return parameters start after input parameters in argTypes
 	for i := 0; i < int(params.n_ret_parameters); i++ {
-		rawParams.ReturnParams = append(rawParams.ReturnParams, parseParam(params.ret_params[i]))
+		rawParams.ReturnParams = append(rawParams.ReturnParams, parseParam(params.ret_params[i], int(params.n_parameters)+i))
 	}
 
 	return rawParams
+}
+
+// usesXMMRegisters returns true if the parameter is passed in XMM/SSE
+// registers, which are not accessible from eBPF uprobes.
+func usesXMMRegisters(param function_parameter_t) bool {
+	if !param.in_reg {
+		return false
+	}
+	for i := 0; i < int(param.n_pieces); i++ {
+		if param.reg_nums[i] >= regnum.AMD64_XMM0 {
+			return true
+		}
+	}
+	return false
 }
 
 func createFunctionParameterList(entry uint64, goidOffset int64, args []UProbeArgMap, isret bool) function_parameter_list_t {

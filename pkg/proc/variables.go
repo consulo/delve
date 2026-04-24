@@ -43,6 +43,8 @@ const (
 	maxMapBucketsFactor = 100 // Maximum numbers of map buckets to read for every requested map entry when loading variables through (*EvalScope).LocalVariables and (*EvalScope).FunctionArguments.
 
 	maxGoroutineUserCurrentDepth = 30 // Maximum depth used by (*G).UserCurrent to search its location
+
+	maxGoroutinesLabelEntries = 1_000 // Maximum number of label entries for a goroutine's label map
 )
 
 type floatSpecial uint8
@@ -257,7 +259,8 @@ func GetG(thread Thread) (*G, error) {
 	if thread.Common().g != nil {
 		return thread.Common().g, nil
 	}
-	if loc, _ := thread.Location(); loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
+	loc, _ := ThreadLocation(thread)
+	if loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
 		// When threads are executing runtime.clone the value of TLS is unreliable.
 		return nil, nil
 	}
@@ -278,11 +281,11 @@ func GetG(thread Thread) (*G, error) {
 		// For our purposes it's better if we always return the real goroutine
 		// since the rest of the code assumes the goroutine ID is univocal.
 		// The real 'current goroutine' is stored in g0.m.curg
-		mvar, err := g.variable.structMember("m")
+		mvar, err := g.variable.structField("m")
 		if err != nil {
 			return nil, err
 		}
-		curgvar, err := mvar.structMember("curg")
+		curgvar, err := mvar.structField("curg")
 		if err != nil {
 			return nil, err
 		}
@@ -296,7 +299,7 @@ func GetG(thread Thread) (*G, error) {
 		g.SystemStack = true
 	}
 	g.Thread = thread
-	if loc, err := thread.Location(); err == nil {
+	if err == nil {
 		g.CurrentLoc = *loc
 	}
 	thread.Common().g = g
@@ -354,7 +357,7 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 			continue
 		}
 		if thg, allocated := threadg[g.ID]; allocated {
-			loc, err := thg.Thread.Location()
+			loc, err := ThreadLocation(thg.Thread)
 			if err != nil {
 				return nil, -1, err
 			}
@@ -488,7 +491,7 @@ func (g *G) Defer() *Defer {
 	if g.variable.Unreadable != nil {
 		return nil
 	}
-	dvar, _ := g.variable.structMember("_defer")
+	dvar, _ := g.variable.structField("_defer")
 	if dvar == nil {
 		return nil
 	}
@@ -582,8 +585,18 @@ func (g *G) Labels() map[string]string {
 						}
 					}
 				case reflect.Struct:
-					labelMap, _ = labelMap.structMember("list")
+					labelMap = structFieldInList(labelMap, "LabelSet", "Set")
 					if labelMap != nil {
+						labelMap = structFieldInList(labelMap, "list", "List")
+					}
+					if labelMap != nil {
+						// ensure the labelMap.Len is a valid value to prevent infinite loops
+						if labelMap.Len < 0 {
+							labelMap.Len = 0
+						}
+						if labelMap.Len > maxGoroutinesLabelEntries {
+							labelMap.Len = maxGoroutinesLabelEntries
+						}
 						for i := int64(0); i < labelMap.Len; i++ {
 							v, err := labelMap.sliceAccess(int(i))
 							if err != nil {
@@ -591,6 +604,12 @@ func (g *G) Labels() map[string]string {
 							}
 							v.loadValue(loadFullValue)
 							if len(v.Children) == 2 {
+								// Skip invalid key-value pairs caused by corrupted or incompatible label structures
+								// (e.g., labels set by some libraries: https://github.com/timandy/routine/blob/v1.1.4/goid.go#L50).
+								// This prevents panics when converting nil values via constant.StringVal().
+								if v.Children[0].Value == nil || v.Children[1].Value == nil {
+									continue
+								}
 								labels[constant.StringVal(v.Children[0].Value)] = constant.StringVal(v.Children[1].Value)
 							}
 						}
@@ -601,6 +620,16 @@ func (g *G) Labels() map[string]string {
 	}
 	g.labels = &labels
 	return *g.labels
+}
+
+func structFieldInList(v *Variable, fieldNames ...string) *Variable {
+	for _, fieldName := range fieldNames {
+		fieldv, _ := v.structField(fieldName)
+		if fieldv != nil {
+			return fieldv
+		}
+	}
+	return nil
 }
 
 type Ancestor struct {
@@ -760,8 +789,8 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 
 var constantMaxInt64 = constant.MakeInt64(1<<63 - 1)
 
-func newConstant(val constant.Value, mem MemoryReadWriter) *Variable {
-	v := &Variable{Value: val, mem: mem, loaded: true}
+func newConstant(val constant.Value, bi *BinaryInfo, mem MemoryReadWriter) *Variable {
+	v := &Variable{Value: val, mem: mem, loaded: true, bi: bi}
 	switch val.Kind() {
 	case constant.Int:
 		v.Kind = reflect.Int
@@ -882,9 +911,18 @@ func (v *Variable) parseG() (*G, error) {
 	if schedVar == nil {
 		return nil, ErrUnreadableG
 	}
-	pc, _ := constant.Int64Val(schedVar.fieldVariable("pc").Value) // +rtype uintptr
-	sp, _ := constant.Int64Val(schedVar.fieldVariable("sp").Value) // +rtype uintptr
-	var bp, lr int64
+
+	var pc, sp, bp, lr int64
+	if pcvar := schedVar.fieldVariable("pc"); /* +rtype uintptr */ pcvar != nil && pcvar.Value != nil {
+		pc, _ = constant.Int64Val(pcvar.Value)
+	} else {
+		return nil, ErrUnreadableG
+	}
+	if spvar := schedVar.fieldVariable("sp"); /* +rtype uintptr */ spvar != nil && spvar.Value != nil {
+		sp, _ = constant.Int64Val(spvar.Value)
+	} else {
+		return nil, ErrUnreadableG
+	}
 	if bpvar := schedVar.fieldVariable("bp"); /* +rtype -opt uintptr */ bpvar != nil && bpvar.Value != nil {
 		bp, _ = constant.Int64Val(bpvar.Value)
 	}
@@ -980,7 +1018,7 @@ func (v *Variable) parseG() (*G, error) {
 }
 
 func (v *Variable) loadFieldNamed(name string) *Variable {
-	v, err := v.structMember(name)
+	v, err := v.structField(name)
 	if err != nil {
 		return nil
 	}
@@ -1016,7 +1054,7 @@ func Ancestors(p *Target, g *G, n int) ([]Ancestor, error) {
 		}
 	}
 
-	av, err := g.variable.structMember("ancestors")
+	av, err := g.variable.structField("ancestors")
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +1131,9 @@ func (a *Ancestor) Stack(n int) ([]Stackframe, error) {
 	return r, nil
 }
 
-func (v *Variable) structMember(memberName string) (*Variable, error) {
+// structField returns the field named memberName in v.
+// This function is meant for internal use, it does not support interfaces, embeds or member methods. For those cases findStructMemberOrMethod should be used instead.
+func (v *Variable) structField(memberName string) (*Variable, error) {
 	if v.Unreadable != nil {
 		return v.clone(), nil
 	}
@@ -1114,18 +1154,22 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 	case reflect.Chan:
 		v = v.clone()
 		v.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.ChanType).TypedefType))
-	case reflect.Interface:
-		v.loadInterface(0, false, LoadConfig{})
-		if len(v.Children) > 0 {
-			v = &v.Children[0]
-		}
 	case reflect.Func:
+		fn := v.bi.PCToFunc(v.Base)
 		v.loadFunctionPtr(0, LoadConfig{MaxVariableRecurse: -1})
 		if v.Unreadable != nil {
+			cst := fn.extra(v.bi).closureStructType
+			if cst == nil || cst.ByteSize == 0 {
+				// Not a closure, normal function
+				if _, ok := v.bi.PackageMap[vname]; ok {
+					return nil, fmt.Errorf("package %s has no function %s", vname, memberName)
+				}
+				return nil, fmt.Errorf("%s has no member %s", vname, memberName)
+			}
 			return nil, v.Unreadable
 		}
 		if v.closureAddr != 0 {
-			fn := v.bi.PCToFunc(v.Base)
+			fn = v.bi.PCToFunc(v.Base)
 			if fn != nil {
 				cst := fn.extra(v.bi).closureStructType
 				v = v.newVariable(v.Name, v.closureAddr, cst, v.mem)
@@ -1134,64 +1178,28 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 		}
 	}
 
-	queue := []*Variable{v}
-	seen := map[string]struct{}{} // prevent infinite loops
-	first := true
+	structVar := v.maybeDereference()
+	structVar.Name = v.Name
+	if structVar.Unreadable != nil {
+		return structVar, nil
+	}
 
-	for len(queue) > 0 {
-		v := queue[0]
-		queue = append(queue[:0], queue[1:]...)
-		if _, isseen := seen[v.RealType.String()]; isseen {
-			continue
+	t, isstruct := structVar.RealType.(*godwarf.StructType)
+	if !isstruct {
+		return nil, fmt.Errorf("%s (type %s) is not a struct", vname, structVar.TypeString())
+	}
+
+	for _, field := range t.Field {
+		if field.Name == memberName {
+			return structVar.toField(field)
 		}
-		seen[v.RealType.String()] = struct{}{}
-
-		structVar := v.maybeDereference()
-		structVar.Name = v.Name
-		if structVar.Unreadable != nil {
-			return structVar, nil
-		}
-
-		switch t := structVar.RealType.(type) {
-		case *godwarf.StructType:
-			for _, field := range t.Field {
-				if field.Name == memberName {
-					return structVar.toField(field)
-				}
-				if len(queue) == 0 && field.Name == "&"+memberName && closure {
-					f, err := structVar.toField(field)
-					if err != nil {
-						return nil, err
-					}
-					return f.maybeDereference(), nil
-				}
-				isEmbeddedStructMember :=
-					field.Embedded ||
-						(field.Type.Common().Name == field.Name) ||
-						(len(field.Name) > 1 &&
-							field.Name[0] == '*' &&
-							field.Type.Common().Name[1:] == field.Name[1:])
-				if !isEmbeddedStructMember {
-					continue
-				}
-				embeddedVar, err := structVar.toField(field)
-				if err != nil {
-					return nil, err
-				}
-				// Check for embedded field referenced by type name
-				parts := strings.Split(field.Name, ".")
-				if len(parts) > 1 && parts[1] == memberName {
-					return embeddedVar, nil
-				}
-				embeddedVar.Name = structVar.Name
-				queue = append(queue, embeddedVar)
+		if field.Name == "&"+memberName && closure {
+			f, err := structVar.toField(field)
+			if err != nil {
+				return nil, err
 			}
-		default:
-			if first {
-				return nil, fmt.Errorf("%s (type %s) is not a struct", vname, structVar.TypeString())
-			}
+			return f.maybeDereference(), nil
 		}
-		first = false
 	}
 
 	return nil, fmt.Errorf("%s has no member %s", vname, memberName)
@@ -1498,11 +1506,11 @@ func convertToEface(srcv, dstv *Variable) error {
 		dstv.writeEmptyInterface(_type.Addr, data)
 		return nil
 	}
-	typeAddr, typeKind, runtimeTypeFound, err := dwarfToRuntimeType(srcv.bi, srcv.mem, srcv.RealType)
+	typeAddr, direct, runtimeTypeFound, err := dwarfToRuntimeType(srcv.bi, srcv.mem, srcv.RealType)
 	if err != nil {
 		return fmt.Errorf("can not convert value of type %s to %s: %v", srcv.DwarfType.String(), dstv.DwarfType.String(), err)
 	}
-	if !runtimeTypeFound || typeKind&kindDirectIface == 0 {
+	if !runtimeTypeFound || !direct {
 		return &typeConvErr{srcv.DwarfType, dstv.RealType}
 	}
 	return dstv.writeEmptyInterface(typeAddr, srcv)
@@ -1547,10 +1555,7 @@ func readStringValue(mem MemoryReadWriter, addr uint64, strlen int64, cfg LoadCo
 		return "", nil
 	}
 
-	count := strlen
-	if count > int64(cfg.MaxStringLen) {
-		count = int64(cfg.MaxStringLen)
-	}
+	count := min(strlen, int64(cfg.MaxStringLen))
 
 	val := make([]byte, int(count))
 	_, err := mem.ReadMemory(val, addr)
@@ -1575,10 +1580,7 @@ func readCStringValue(mem MemoryReadWriter, addr uint64, cfg LoadConfig) (string
 		// divisor for all architectures.
 		curaddr := addr + uint64(len(val))
 		maxsize := int(alignAddr(int64(curaddr+1), 1024) - int64(curaddr))
-		size := len(buf)
-		if size > maxsize {
-			size = maxsize
-		}
+		size := min(len(buf), maxsize)
 
 		_, err := mem.ReadMemory(buf[:size], curaddr)
 		if err != nil {
@@ -2076,9 +2078,9 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 			isnil = tab.Addr == 0
 			if !isnil {
 				var err error
-				_type, err = tab.structMember("Type") // +rtype *internal/abi.Type
+				_type, err = tab.structField("Type") // +rtype *internal/abi.Type
 				if err != nil {
-					_type, err = tab.structMember("_type") // +rtype *_type|*internal/abi.Type
+					_type, err = tab.structField("_type") // +rtype *_type|*internal/abi.Type
 					if err != nil {
 						v.Unreadable = fmt.Errorf("invalid interface type: %v", err)
 						return
@@ -2113,20 +2115,20 @@ func (v *Variable) loadInterface(recurseLevel int, loadData bool, cfg LoadConfig
 		return
 	}
 
-	mds, err := LoadModuleData(_type.bi, _type.mem)
+	mds, err := _type.bi.getModuleData(_type.mem)
 	if err != nil {
 		v.Unreadable = fmt.Errorf("error loading module data: %v", err)
 		return
 	}
 
-	typ, kind, err := RuntimeTypeToDIE(_type, data.Addr, mds)
+	typ, directIface, err := RuntimeTypeToDIE(_type, data.Addr, mds)
 	if err != nil {
 		v.Unreadable = err
 		return
 	}
 
 	deref := false
-	if kind&kindDirectIface == 0 {
+	if !directIface {
 		realtyp := godwarf.ResolveTypedef(typ)
 		if _, isptr := realtyp.(*godwarf.PtrType); !isptr {
 			typ = pointerTo(typ, v.bi.Arch)
@@ -2181,47 +2183,47 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 		var child *Variable
 		switch newtyp {
 		case "int8":
-			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.bi, v.mem)
 			child.Kind = reflect.Int8
 			n = 1
 		case "int16":
-			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int16
 			n = 2
 		case "int32":
-			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int32
 			n = 4
 		case "int64":
-			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Int64
 			n = 8
 		case "uint8":
-			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.bi, v.mem)
 			child.Kind = reflect.Uint8
 			n = 1
 		case "uint16":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint16
 			n = 2
 		case "uint32":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint32
 			n = 4
 		case "uint64":
-			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.mem)
+			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.bi, v.mem)
 			child.Kind = reflect.Uint64
 			n = 8
 		case "float32":
 			a := binary.LittleEndian.Uint32(v.reg.Bytes[i:])
 			x := *(*float32)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(float64(x)), v.mem)
+			child = newConstant(constant.MakeFloat64(float64(x)), v.bi, v.mem)
 			child.Kind = reflect.Float32
 			n = 4
 		case "float64":
 			a := binary.LittleEndian.Uint64(v.reg.Bytes[i:])
 			x := *(*float64)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(x), v.mem)
+			child = newConstant(constant.MakeFloat64(x), v.bi, v.mem)
 			child.Kind = reflect.Float64
 			n = 8
 		default:
@@ -2237,7 +2239,7 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 				}
 				n = n / 8
 			}
-			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.mem)
+			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.bi, v.mem)
 		}
 		v.Children = append(v.Children, *child)
 	}

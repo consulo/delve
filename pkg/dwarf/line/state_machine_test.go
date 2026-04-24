@@ -30,6 +30,7 @@ func slurpGzip(path string) ([]byte, error) {
 }
 
 func TestGrafana(t *testing.T) {
+	t.Parallel()
 	// Compares a full execution of our state machine on the debug_line section
 	// of grafana to the output generated using debug/dwarf.LineReader on the
 	// same section.
@@ -122,6 +123,7 @@ func checkCompileUnit(t *testing.T, cuname string, lnrdr *dwarf.LineReader, sm *
 }
 
 func TestMultipleSequences(t *testing.T) {
+	t.Parallel()
 	// Check that our state machine (specifically PCToLine and AllPCsBetween)
 	// are correct when dealing with units containing more than one sequence.
 
@@ -149,6 +151,10 @@ func TestMultipleSequences(t *testing.T) {
 	write_DW_LNS_advance_line := func(off int64) {
 		instr.WriteByte(DW_LNS_advance_line)
 		leb128.EncodeSigned(instr, off)
+	}
+
+	write_DW_LNS_prologue_end := func() {
+		instr.WriteByte(DW_LNS_prologue_end)
 	}
 
 	write_DW_LNE_end_sequence := func() {
@@ -185,6 +191,7 @@ func TestMultipleSequences(t *testing.T) {
 	write_DW_LNS_copy() // thefile.go:21 0x500000
 	write_DW_LNS_advance_pc(0x2)
 	write_DW_LNS_advance_line(1)
+	write_DW_LNS_prologue_end()
 	write_DW_LNS_copy() // thefile.go:22 0x500002
 	write_DW_LNS_advance_pc(0x2)
 	write_DW_LNS_advance_line(1)
@@ -203,10 +210,11 @@ func TestMultipleSequences(t *testing.T) {
 			OpcodeBase:     13,
 			StdOpLengths:   []uint8{0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1},
 		},
-		IncludeDirs:  []string{},
-		FileNames:    []*FileEntry{{Path: thefile}},
-		Instructions: instr.Bytes(),
-		ptrSize:      ptrSize,
+		IncludeDirs:       []string{},
+		FileNames:         []*FileEntry{{Path: thefile}},
+		Instructions:      instr.Bytes(),
+		ptrSize:           ptrSize,
+		stateMachineCache: make(map[uint64]*StateMachine),
 	}
 
 	// Test that PCToLine is correct for all three sequences
@@ -257,5 +265,11 @@ func TestMultipleSequences(t *testing.T) {
 		if len(out) != len(testCase.tgt) {
 			t.Errorf("AllPCsBetween(%#x, %#x): expected: %#x got: %#x", testCase.start, testCase.end, testCase.tgt, out)
 		}
+	}
+
+	// Test that PrologueEndPC does not return a PC address before the start address (issue #4269)
+	pc, _, _, ok := lines.PrologueEndPC(0x600000, 0x600008)
+	if ok && pc < 0x600000 {
+		t.Errorf("PrologueEndPC failed %x", pc)
 	}
 }

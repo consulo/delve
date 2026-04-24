@@ -112,7 +112,7 @@ type LaunchConfig struct {
 	// or
 	//    "buildFlags": ["-tags=integration", "-ldflags=-X main.Hello=World"]
 	// Using other types is an error.
-	BuildFlags BuildFlags `json:"buildFlags,omitempty"`
+	BuildFlags BuildFlags `json:"buildFlags"`
 
 	// Output path for the binary of the debuggee.
 	// Relative path is interpreted as the path relative to
@@ -159,11 +159,21 @@ type LaunchConfig struct {
 	// The output mode specifies how to handle the program's output.
 	OutputMode string `json:"outputMode,omitempty"`
 
+	StdinFrom string `json:"stdinFrom,omitempty"` // Redirects stadard input to a file
+	StdoutTo  string `json:"stdoutTo,omitempty"`  // Redirects standard output to a file
+	StderrTo  string `json:"stderrTo,omitempty"`  // Redirects standard error to a file
+
 	LaunchAttachCommonConfig
 }
 
 // LaunchAttachCommonConfig is the attributes common in both launch/attach requests.
 type LaunchAttachCommonConfig struct {
+	// FollowExec enables or disables follow exec mode.
+	FollowExec bool `json:"followExec,omitempty"`
+
+	// FollowExecRegex is a regular expression. Only child processes with a command line matching the regular expression will be followed.
+	FollowExecRegex string `json:"followExecRegex,omitempty"`
+
 	// Automatically stop program after launch or attach.
 	StopOnEntry bool `json:"stopOnEntry,omitempty"`
 
@@ -265,7 +275,7 @@ type AttachConfig struct {
 // unmarshalLaunchAttachArgs wraps unmarshaling of launch/attach request's
 // arguments attribute. Upon unmarshal failure, it returns an error massaged
 // to be suitable for end-users.
-func unmarshalLaunchAttachArgs(input json.RawMessage, config interface{}) error {
+func unmarshalLaunchAttachArgs(input json.RawMessage, config any) error {
 	if err := json.Unmarshal(input, config); err != nil {
 		if uerr, ok := err.(*json.UnmarshalTypeError); ok {
 			// Format json.UnmarshalTypeError error string in our own way. E.g.,
@@ -284,7 +294,7 @@ func unmarshalLaunchAttachArgs(input json.RawMessage, config interface{}) error 
 	return nil
 }
 
-func prettyPrint(config interface{}) string {
+func prettyPrint(config any) string {
 	pretty, err := json.MarshalIndent(config, "", "\t")
 	if err != nil {
 		return fmt.Sprintf("%#v", config)
@@ -294,7 +304,7 @@ func prettyPrint(config interface{}) string {
 
 // BuildFlags is either string or []string.
 type BuildFlags struct {
-	value interface{}
+	value any
 }
 
 func (s *BuildFlags) UnmarshalJSON(b []byte) error {

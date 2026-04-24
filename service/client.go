@@ -9,6 +9,9 @@ import (
 // Client represents a debugger service client. All client methods are
 // synchronous.
 type Client interface {
+	// GetVersion returns assorted version information.
+	GetVersion() *api.GetVersionOut
+
 	// ProcessPid returns the pid of the process we are debugging.
 	ProcessPid() int
 
@@ -98,6 +101,8 @@ type Client interface {
 	ListPackageVariables(filter string, cfg api.LoadConfig) ([]api.Variable, error)
 	// EvalVariable returns a variable in the context of the current thread.
 	EvalVariable(scope api.EvalScope, symbol string, cfg api.LoadConfig) (*api.Variable, error)
+	// TypeInfo returns informations about a type.
+	TypeInfo(name string) (*api.TypeInfo, error)
 
 	// SetVariable sets the value of a variable
 	SetVariable(scope api.EvalScope, symbol, value string) error
@@ -125,7 +130,7 @@ type Client interface {
 	ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions, scope *api.EvalScope) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error)
 
 	// Stacktrace returns stacktrace
-	Stacktrace(goroutineID int64, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
+	Stacktrace(goroutineID int64, depth, skip int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
 
 	// Ancestors returns ancestor stacktraces
 	Ancestors(goroutineID int64, numAncestors int, depth int) ([]api.Ancestor, error)
@@ -166,11 +171,14 @@ type Client interface {
 	// SetReturnValuesLoadConfig sets the load configuration for return values.
 	SetReturnValuesLoadConfig(*api.LoadConfig)
 
+	// SetEventsFn sets a function that will be called whenever a debugger event is received.
+	SetEventsFn(func(*api.Event))
+
 	// IsMulticlient returns true if the headless instance is multiclient.
 	IsMulticlient() bool
 
 	// ListDynamicLibraries returns a list of loaded dynamic libraries.
-	ListDynamicLibraries() ([]api.Image, error)
+	ListDynamicLibraries() ([]api.Image, bool, error)
 
 	// ExamineMemory returns the raw memory stored at the given address.
 	// The amount of data to be read is specified by length which must be less than or equal to 1000.
@@ -208,6 +216,11 @@ type Client interface {
 	// GuessSubstitutePath tries to guess a substitute-path configuration for the client
 	GuessSubstitutePath() ([][2]string, error)
 
+	// CancelDownloads cancels binary info downloads, if any.
+	CancelDownloads() error
+	// DownloadLibraryDebugInfo attempts to download the specified library's debug info.
+	DownloadLibraryDebugInfo(n int) error
+
 	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
-	CallAPI(method string, args, reply interface{}) error
+	CallAPI(method string, args, reply any) error
 }

@@ -41,25 +41,27 @@ To debug in IntelliJ Idea, open the 'Maven Projects' tool window (View
 version = "2023.05"
 
 val targets = arrayOf(
-        "linux/amd64/1.22",
-        "linux/amd64/1.23",
         "linux/amd64/1.24",
+        "linux/amd64/1.25",
+        "linux/amd64/1.26",
         "linux/amd64/tip",
 
-        "linux/386/1.24",
+        "linux/386/1.26",
 
-        "linux/arm64/1.24",
+        "linux/arm64/1.26",
         "linux/arm64/tip",
 
-        "linux/ppc64le/1.24",
+        "linux/ppc64le/1.26",
 
-        "windows/amd64/1.24",
+        // "linux/riscv64/1.26", // needs exp.linuxriscv64 build tag, disabled due to CI issues
+
+        "windows/amd64/1.26",
         "windows/amd64/tip",
 
-        "mac/amd64/1.24",
+        "mac/amd64/1.26",
         "mac/amd64/tip",
 
-        "mac/arm64/1.24",
+        "mac/arm64/1.26",
         "mac/arm64/tip"
 )
 
@@ -83,6 +85,7 @@ project {
     }))
     params {
         param("teamcity.ui.settings.readOnly", "true")
+        param("env.CI", "true")
     }
 }
 
@@ -221,11 +224,15 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
                         dockerArch
                     }
                 }
+                val ubuntuVersion = when (arch) {
+                    "riscv64" -> "24.04"
+                    else -> "20.04"
+                }
                 dockerCommand {
                     name = "Pull Ubuntu"
                     commandType = other {
                         subCommand = "pull"
-                        commandArgs = "$dockerArch/ubuntu:20.04"
+                        commandArgs = "$dockerArch/ubuntu:$ubuntuVersion"
                     }
                 }
                 dockerCommand {
@@ -238,7 +245,7 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
                         --env CI=true
                         --privileged
                         --platform linux/$dockerPlatformArch
-                        $dockerArch/ubuntu:20.04
+                        $dockerArch/ubuntu:$ubuntuVersion
                         /delve/_scripts/test_linux.sh ${"go$version"} $arch
                     """.trimIndent()
                     }
@@ -268,7 +275,8 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
             "386", "amd64" -> equals("teamcity.agent.jvm.os.arch", if (os == "mac") "x86_64" else "amd64")
             "arm64" -> equals("teamcity.agent.jvm.os.arch", "aarch64")
             "ppc64le" -> equals("teamcity.agent.jvm.os.arch", "ppc64le")
-            // "riscv64" -> equals("teamcity.agent.jvm.os.arch", "riscv64") // The riscv64 needs a builder
+            "riscv64" -> equals("teamcity.agent.jvm.os.arch", "riscv64")
+            "loong64" -> equals("teamcity.agent.jvm.os.arch", "loongarch64")
         }
         when (os) {
             "linux" -> {

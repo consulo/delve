@@ -28,6 +28,7 @@ func ConvertLogicalBreakpoint(lbp *proc.LogicalBreakpoint) *Breakpoint {
 		Variables:        lbp.Variables,
 		LoadArgs:         LoadConfigFromProc(lbp.LoadArgs),
 		LoadLocals:       LoadConfigFromProc(lbp.LoadLocals),
+		CustomCommands:   lbp.CustomCommands,
 		TotalHitCount:    lbp.TotalHitCount,
 		Disabled:         !lbp.Enabled(),
 		UserData:         lbp.UserData,
@@ -97,7 +98,7 @@ func ConvertThread(th proc.Thread, bp *Breakpoint) *Thread {
 		gid      int64
 	)
 
-	loc, err := th.Location()
+	loc, err := proc.ThreadLocation(th)
 	if err == nil {
 		pc = loc.PC
 		file = loc.File
@@ -461,4 +462,32 @@ func ConvertTarget(tgt *proc.Target, convertThreadBreakpoint func(proc.Thread) *
 		CmdLine:       tgt.CmdLine,
 		CurrentThread: ConvertThread(tgt.CurrentThread(), convertThreadBreakpoint(tgt.CurrentThread())),
 	}
+}
+
+func ConvertEvent(event *proc.Event) *Event {
+	r := &Event{Kind: EventKind(event.Kind)}
+
+	if event.BinaryInfoDownloadEventDetails != nil {
+		r.BinaryInfoDownloadEventDetails = &BinaryInfoDownloadEventDetails{
+			ImagePath: event.BinaryInfoDownloadEventDetails.ImagePath,
+			Progress:  event.BinaryInfoDownloadEventDetails.Progress,
+		}
+	}
+
+	if event.BreakpointMaterializedEventDetails != nil {
+		r.BreakpointMaterializedEventDetails = &BreakpointMaterializedEventDetails{
+			Breakpoint: ConvertLogicalBreakpoint(event.BreakpointMaterializedEventDetails.Breakpoint),
+		}
+	}
+
+	if event.ProcessSpawnedEventDetails != nil {
+		r.ProcessSpawnedEventDetails = &ProcessSpawnedEventDetails{
+			PID:        event.ProcessSpawnedEventDetails.PID,
+			ThreadID:   event.ProcessSpawnedEventDetails.ThreadID,
+			Cmdline:    event.ProcessSpawnedEventDetails.Cmdline,
+			WillFollow: event.ProcessSpawnedEventDetails.WillFollow,
+		}
+	}
+
+	return r
 }

@@ -13,17 +13,16 @@ import (
 
 // The kind field in runtime._type is a reflect.Kind value plus
 // some extra flags defined here.
-// See equivalent declaration in $GOROOT/src/reflect/type.go
+// See equivalent declaration in $GOROOT/src/internal/abi/type.go
 const (
+	// Go 1.25 and earlier
 	kindDirectIface = 1 << 5 // +rtype kindDirectIface|internal/abi.KindDirectIface
-	kindGCProg      = 1 << 6 // +rtype kindGCProg|internal/abi.KindGCProg
-	kindNoPointers  = 1 << 7
-	kindMask        = (1 << 5) - 1 // +rtype kindMask|internal/abi.KindMask
+	// Go 1.26 and later
+	tflagDirectIface = 1 << 5 // +rtype go1.26 tflagDirectIface|internal/abi.TFlagDirectIface
 )
 
 type runtimeTypeDIE struct {
 	offset dwarf.Offset
-	kind   int64
 }
 
 func pointerTo(typ godwarf.Type, arch *Arch) godwarf.Type {
@@ -80,7 +79,7 @@ func (ctxt *loadDebugInfoMapsContext) lookupAbstractOrigin(bi *BinaryInfo, off d
 //     debug_info
 //   - After go1.11 the runtimeTypeToDIE map is used to look up the address of
 //     the type and map it directly to a DIE.
-func RuntimeTypeToDIE(_type *Variable, dataAddr uint64, mds []ModuleData) (typ godwarf.Type, kind int64, err error) {
+func RuntimeTypeToDIE(_type *Variable, dataAddr uint64, mds []ModuleData) (typ godwarf.Type, directIface bool, err error) {
 	bi := _type.bi
 
 	_type = _type.maybeDereference()
@@ -94,21 +93,14 @@ func RuntimeTypeToDIE(_type *Variable, dataAddr uint64, mds []ModuleData) (typ g
 			if rtdie, ok := so.runtimeTypeToDIE[_type.Addr-md.types]; ok {
 				typ, err := godwarf.ReadType(so.dwarf, so.index, rtdie.offset, so.typeCache)
 				if err != nil {
-					return nil, 0, fmt.Errorf("invalid interface type: %v", err)
+					return nil, false, fmt.Errorf("invalid interface type: %v", err)
 				}
-				if rtdie.kind == -1 {
-					if kindField := _type.loadFieldNamed("kind"); kindField != nil && kindField.Value != nil {
-						rtdie.kind, _ = constant.Int64Val(kindField.Value)
-					} else if kindField := _type.loadFieldNamed("Kind_"); kindField != nil && kindField.Value != nil {
-						rtdie.kind, _ = constant.Int64Val(kindField.Value)
-					}
-				}
-				return typ, rtdie.kind, nil
+				return typ, getRuntimeTypeDirect(_type), nil
 			}
 		}
 	}
 
-	return nil, 0, errors.New("could not resolve interface type")
+	return nil, false, errors.New("could not resolve interface type")
 }
 
 // resolveParametricType returns the real type of t if t is a parametric
@@ -144,30 +136,30 @@ func resolveParametricType(bi *BinaryInfo, mem MemoryReadWriter, t godwarf.Type,
 	return typ, nil
 }
 
-func dwarfToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) (typeAddr uint64, typeKind uint64, found bool, err error) {
+func dwarfToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) (typeAddr uint64, direct, found bool, err error) {
 	so := bi.typeToImage(typ)
 	rdr := so.DwarfReader()
 	rdr.Seek(typ.Common().Offset)
 	e, err := rdr.Next()
 	if err != nil {
-		return 0, 0, false, err
+		return 0, false, false, err
 	}
 	off, ok := e.Val(godwarf.AttrGoRuntimeType).(uint64)
 	if !ok {
-		return 0, 0, false, nil
+		return 0, false, false, nil
 	}
 
-	mds, err := LoadModuleData(bi, mem)
+	mds, err := bi.getModuleData(mem)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, false, false, err
 	}
 
 	md := bi.imageToModuleData(so, mds)
 	if md == nil {
 		if so.index > 0 {
-			return 0, 0, false, fmt.Errorf("could not find module data for type %s (shared object: %q)", typ, so.Path)
+			return 0, false, false, fmt.Errorf("could not find module data for type %s (shared object: %q)", typ, so.Path)
 		} else {
-			return 0, 0, false, fmt.Errorf("could not find module data for type %s", typ)
+			return 0, false, false, fmt.Errorf("could not find module data for type %s", typ)
 		}
 	}
 
@@ -175,38 +167,35 @@ func dwarfToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) 
 
 	rtyp, err := bi.findType(bi.runtimeTypeTypename())
 	if err != nil {
-		return 0, 0, false, err
+		return 0, false, false, err
 	}
 	_type := newVariable("", typeAddr, rtyp, bi, mem)
-	kindv := _type.loadFieldNamed("kind")
-	if kindv == nil || kindv.Unreadable != nil || kindv.Kind != reflect.Uint {
-		kindv = _type.loadFieldNamed("Kind_")
-	}
-	if kindv == nil {
-		return 0, 0, false, fmt.Errorf("unreadable interface type (no kind field)")
-	}
-	if kindv.Unreadable != nil || kindv.Kind != reflect.Uint {
-		return 0, 0, false, fmt.Errorf("unreadable interface type: %v", kindv.Unreadable)
-	}
-	typeKind, _ = constant.Uint64Val(kindv.Value)
-	return typeAddr, typeKind, true, nil
+
+	return typeAddr, getRuntimeTypeDirect(_type), true, nil
 }
 
-func dieToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) (uint64, error) {
-	typc := typ.Common()
-	so := bi.Images[typc.Index]
-	mds, err := bi.getModuleData(mem)
-	if err != nil {
-		return 0, err
-	}
-	md := findModuleDataForImage(mds, so)
-	if md == nil {
-		return 0, fmt.Errorf("could not allocate type %s", typ.String())
-	}
-	for off, rtdie := range so.runtimeTypeToDIE {
-		if rtdie.offset == typc.Offset {
-			return md.types + off, nil
+// getRuntimeTypeDirect returns a bool that says if the type in _type can be stored directly into an interface variable.
+func getRuntimeTypeDirect(_type *Variable) bool {
+	// Go 1.26 and beyond have this flag in the TFlag field.
+	// Go 1.25 and earlier have this flag in the Kind field.
+	// If either flag is set, consider it direct.
+	var direct bool
+	if tflagField := _type.loadFieldNamed("TFlag"); tflagField != nil && tflagField.Value != nil {
+		tflag, _ := constant.Int64Val(tflagField.Value)
+		if tflag&tflagDirectIface != 0 {
+			direct = true
 		}
 	}
-	return 0, fmt.Errorf("could not allocate type %s", typ.String())
+	if kindField := _type.loadFieldNamed("kind"); kindField != nil && kindField.Value != nil {
+		kind, _ := constant.Int64Val(kindField.Value)
+		if kind&kindDirectIface != 0 {
+			direct = true
+		}
+	} else if kindField := _type.loadFieldNamed("Kind_"); kindField != nil && kindField.Value != nil {
+		kind, _ := constant.Int64Val(kindField.Value)
+		if kind&kindDirectIface != 0 {
+			direct = true
+		}
+	}
+	return direct
 }

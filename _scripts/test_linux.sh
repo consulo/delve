@@ -18,6 +18,11 @@ if [ "$arch" != "ppc64le" ]; then
 	dwz --version
 fi
 
+if [ "$arch" == "riscv64" ]; then
+	apt-get install -y git
+	git --version
+fi
+
 function getgo {
 	export GOROOT=/usr/local/go/$1
 	if [ ! -d "$GOROOT" ]; then
@@ -48,14 +53,15 @@ else
 	getgo $version
 fi
 
-
 GOPATH=$(pwd)/go
 export GOPATH
 export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
 go version
 if [ "$arch" != "ppc64le" ]; then
-	go install honnef.co/go/tools/cmd/staticcheck@2024.1.1 || true
+	go install honnef.co/go/tools/cmd/staticcheck@2025.1.1 || true
 fi
+
+go install github.com/google/capslock/cmd/capslock@latest
 
 uname -a
 echo "$PATH"

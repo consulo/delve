@@ -1,4 +1,4 @@
-// DO NOT EDIT: auto-generated using _scripts/gen-suitablemethods.go
+// DO NOT EDIT: auto-generated using github.com/go-delve/build-tools/cmd/gen-suitablemethods
 
 package rpccommon
 
@@ -12,6 +12,7 @@ func suitableMethods2(s *rpc2.RPCServer, methods map[string]*methodType) {
 	methods["RPCServer.Ancestors"] = &methodType{method: reflect.ValueOf(s.Ancestors)}
 	methods["RPCServer.AttachedToExistingProcess"] = &methodType{method: reflect.ValueOf(s.AttachedToExistingProcess)}
 	methods["RPCServer.BuildID"] = &methodType{method: reflect.ValueOf(s.BuildID)}
+	methods["RPCServer.CancelDownloads"] = &methodType{method: reflect.ValueOf(s.CancelDownloads)}
 	methods["RPCServer.CancelNext"] = &methodType{method: reflect.ValueOf(s.CancelNext)}
 	methods["RPCServer.Checkpoint"] = &methodType{method: reflect.ValueOf(s.Checkpoint)}
 	methods["RPCServer.ClearBreakpoint"] = &methodType{method: reflect.ValueOf(s.ClearBreakpoint)}
@@ -23,6 +24,7 @@ func suitableMethods2(s *rpc2.RPCServer, methods map[string]*methodType) {
 	methods["RPCServer.DebugInfoDirectories"] = &methodType{method: reflect.ValueOf(s.DebugInfoDirectories)}
 	methods["RPCServer.Detach"] = &methodType{method: reflect.ValueOf(s.Detach)}
 	methods["RPCServer.Disassemble"] = &methodType{method: reflect.ValueOf(s.Disassemble)}
+	methods["RPCServer.DownloadLibraryDebugInfo"] = &methodType{method: reflect.ValueOf(s.DownloadLibraryDebugInfo)}
 	methods["RPCServer.DumpCancel"] = &methodType{method: reflect.ValueOf(s.DumpCancel)}
 	methods["RPCServer.DumpStart"] = &methodType{method: reflect.ValueOf(s.DumpStart)}
 	methods["RPCServer.DumpWait"] = &methodType{method: reflect.ValueOf(s.DumpWait)}
@@ -34,6 +36,7 @@ func suitableMethods2(s *rpc2.RPCServer, methods map[string]*methodType) {
 	methods["RPCServer.FunctionReturnLocations"] = &methodType{method: reflect.ValueOf(s.FunctionReturnLocations)}
 	methods["RPCServer.GetBreakpoint"] = &methodType{method: reflect.ValueOf(s.GetBreakpoint)}
 	methods["RPCServer.GetBufferedTracepoints"] = &methodType{method: reflect.ValueOf(s.GetBufferedTracepoints)}
+	methods["RPCServer.GetEvents"] = &methodType{method: reflect.ValueOf(s.GetEvents)}
 	methods["RPCServer.GetThread"] = &methodType{method: reflect.ValueOf(s.GetThread)}
 	methods["RPCServer.GuessSubstitutePath"] = &methodType{method: reflect.ValueOf(s.GuessSubstitutePath)}
 	methods["RPCServer.IsMulticlient"] = &methodType{method: reflect.ValueOf(s.IsMulticlient)}
@@ -60,6 +63,7 @@ func suitableMethods2(s *rpc2.RPCServer, methods map[string]*methodType) {
 	methods["RPCServer.State"] = &methodType{method: reflect.ValueOf(s.State)}
 	methods["RPCServer.StopRecording"] = &methodType{method: reflect.ValueOf(s.StopRecording)}
 	methods["RPCServer.ToggleBreakpoint"] = &methodType{method: reflect.ValueOf(s.ToggleBreakpoint)}
+	methods["RPCServer.TypeInfo"] = &methodType{method: reflect.ValueOf(s.TypeInfo)}
 }
 
 func suitableMethodsCommon(s *RPCServer, methods map[string]*methodType) {
