@@ -17,21 +17,25 @@ jobs:
             elf_machine: Advanced Micro Devices X86-64
             runs_on: ubuntu-latest
             cross: false
+            tags: ''
           - arch: aarch64
             goarch: arm64
             elf_machine: AArch64
             runs_on: ubuntu-24.04-arm
             cross: false
+            tags: ''
           - arch: loongarch64
             goarch: loong64
             elf_machine: LoongArch
             runs_on: ubuntu-latest
             cross: true
+            tags: exp.linuxloong64
           - arch: riscv64
             goarch: riscv64
             elf_machine: RISC-V
             runs_on: ubuntu-latest
             cross: true
+            tags: exp.linuxriscv64
 
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -49,7 +53,7 @@ jobs:
         if: matrix.cross
         env:
           CGO_ENABLED: '0'
-        run: go run _scripts/make.go build --GOOS=linux --GOARCH=${{ matrix.goarch }}
+        run: go run _scripts/make.go build --GOOS=linux --GOARCH=${{ matrix.goarch }} --tags=${{ matrix.tags }}
 
       - name: Verify ELF architecture
         run: |
