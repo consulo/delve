@@ -13,17 +13,36 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            macho_arch: x86_64
             runs_on: macos-13
           - arch: aarch64
+            macho_arch: arm64
             runs_on: macos-latest
 
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
-      - name: install go
-        run: brew install go
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: build
         run: go run _scripts/make.go build
+
+      - name: Verify Mach-O architecture
+        run: |
+          set -euo pipefail
+          echo "File: dlv"
+          lipo -archs dlv
+          echo
+          ARCHS=$(lipo -archs dlv)
+          if [ "$ARCHS" != "${{ matrix.macho_arch }}" ]; then
+              echo "::error::Mach-O arch mismatch. Expected '${{ matrix.macho_arch }}' for ${{ matrix.arch }}, got '$ARCHS'."
+              exit 1
+          fi
+          echo "OK: Mach-O arch is '$ARCHS' as expected."
+
       - uses: actions/upload-artifact@v4
         with:
           name: dlv-macos-${{ matrix.arch }}

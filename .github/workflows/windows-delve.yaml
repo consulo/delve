@@ -13,15 +13,44 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            msvc_arch: x64
+            pe_machine: x64
             runs_on: windows-2022
           - arch: aarch64
+            msvc_arch: arm64
+            pe_machine: ARM64
             runs_on: windows-11-arm
 
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: build
         run: go run _scripts/make.go build
+
+      - name: Setup MSVC (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Verify PE machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "File: dlv.exe"
+          dumpbin //HEADERS dlv.exe | grep -E "machine \(.*\)" | head -1
+          echo
+          MACHINE=$(dumpbin //HEADERS dlv.exe | grep -E "machine \(.*\)" | head -1 | sed -E 's/.*machine \(([^)]*)\).*/\1/')
+          if [ "$MACHINE" != "${{ matrix.pe_machine }}" ]; then
+              echo "::error::PE machine mismatch. Expected '${{ matrix.pe_machine }}' for ${{ matrix.arch }}, got '$MACHINE'."
+              exit 1
+          fi
+          echo "OK: PE machine is '$MACHINE' as expected."
+
       - uses: actions/upload-artifact@v4
         with:
           name: dlv-windows-${{ matrix.arch }}
