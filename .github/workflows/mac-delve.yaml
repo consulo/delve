@@ -14,10 +14,14 @@ jobs:
         include:
           - arch: x86_64
             macho_arch: x86_64
-            runs_on: macos-13
+            runs_on: macos-latest
+            goarch: amd64
+            cross: true
           - arch: aarch64
             macho_arch: arm64
             runs_on: macos-latest
+            goarch: arm64
+            cross: false
 
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -27,8 +31,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: build
+      - name: build (native)
+        if: ${{ !matrix.cross }}
         run: go run _scripts/make.go build
+
+      - name: build (cross x86_64 on arm64 runner)
+        if: matrix.cross
+        env:
+          CGO_ENABLED: '1'
+          CC: clang -arch x86_64
+          CXX: clang++ -arch x86_64
+        run: go run _scripts/make.go build --GOOS=darwin --GOARCH=${{ matrix.goarch }}
 
       - name: Verify Mach-O architecture
         run: |
