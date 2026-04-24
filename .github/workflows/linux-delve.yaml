@@ -1,0 +1,95 @@
+name: linux-delve
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            goarch: amd64
+            runs_on: ubuntu-latest
+            cross: false
+          - arch: aarch64
+            goarch: arm64
+            runs_on: ubuntu-24.04-arm
+            cross: false
+          - arch: loongarch64
+            goarch: loong64
+            runs_on: ubuntu-latest
+            cross: true
+          - arch: riscv64
+            goarch: riscv64
+            runs_on: ubuntu-latest
+            cross: true
+
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build (native)
+        if: ${{ !matrix.cross }}
+        run: go run _scripts/make.go build
+
+      - name: build (cross)
+        if: matrix.cross
+        env:
+          CGO_ENABLED: '0'
+        run: go run _scripts/make.go build -os linux -arch ${{ matrix.goarch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlv-linux-${{ matrix.arch }}
+          path: dlv
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: binaries-publish
+      cancel-in-progress: false
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Arrange binaries by os-arch
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for dir in artifacts/dlv-linux-*/; do
+            name=$(basename "$dir")
+            arch="${name#dlv-linux-}"
+            mkdir -p "out/linux-$arch"
+            cp "$dir"dlv "out/linux-$arch/"
+            chmod +x "out/linux-$arch/dlv"
+          done
+          find out -type f
+
+      - name: Commit and push to consulo/binaries
+        env:
+          CONSULO_BOT_TOKEN: ${{ secrets.CONSULO_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone "https://consulo-bot:${CONSULO_BOT_TOKEN}@github.com/consulo/binaries.git" binaries-repo
+          cd binaries-repo
+          git checkout master 2>/dev/null || git checkout --orphan master
+          git config user.name "consulo Bot"
+          git config user.email "consulo.bot@gmail.com"
+          cp -r ../out/. .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update delve linux binaries from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+            git push -u origin master
+          fi
