@@ -4,6 +4,7 @@ package gobuild
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -18,15 +19,20 @@ import (
 // This can be used to remove the temporary binary generated for the session.
 func Remove(path string) {
 	var err error
-	for range 20 {
+	// Open files can be removed on Unix, but not on Windows, where there also appears
+	// to be a delay in releasing the binary when the process exits.
+	// Leaving temporary files behind can be annoying to users, so we try again.
+	//
+	// Does backoff exponentially starting at 1ms all the way to ~400ms for a
+	// total of 4.8s of wait time.
+	for i := range 66 {
+		if i != 0 {
+			time.Sleep(time.Millisecond * time.Duration(math.Pow(1.1, float64(i-1))))
+		}
 		err = os.Remove(path)
-		// Open files can be removed on Unix, but not on Windows, where there also appears
-		// to be a delay in releasing the binary when the process exits.
-		// Leaving temporary files behind can be annoying to users, so we try again.
 		if err == nil || runtime.GOOS != "windows" {
 			break
 		}
-		time.Sleep(1 * time.Millisecond)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "could not remove %v: %v\n", path, err)
@@ -68,21 +74,12 @@ func GoTestBuildCombinedOutput(debugname string, pkgs []string, buildflags any) 
 }
 
 func goBuildArgs(debugname string, pkgs []string, buildflags string, isTest bool) []string {
-	var args []string
-
-	bfv := config.SplitQuotedFields(buildflags, '\'')
-	if len(bfv) >= 2 && bfv[0] == "-C" {
-		args = append(args, bfv[:2]...)
-		bfv = bfv[2:]
-	} else if len(bfv) >= 1 && strings.HasPrefix(bfv[0], "-C=") {
-		args = append(args, bfv[0])
-		bfv = bfv[1:]
-	}
-
-	args = append(args, "-o", debugname)
+	leading, bfv := splitLeadingGoDir(config.SplitQuotedFields(buildflags, '\''))
+	args := append([]string{}, leading...)
 	if isTest {
-		args = append([]string{"-c"}, args...)
+		args = append(args, "-c")
 	}
+	args = append(args, "-o", debugname)
 	args = append(args, "-gcflags", "all=-N -l")
 	if buildflags != "" {
 		args = append(args, bfv...)
@@ -99,17 +96,34 @@ func goBuildArgs2(debugname string, pkgs []string, buildflags any, isTest bool) 
 		return goBuildArgs(debugname, pkgs, buildflags, isTest), nil
 	case nil:
 	case []string:
-		args = append(args, buildflags...)
+		leading, rest := splitLeadingGoDir(buildflags)
+		args = append(args, leading...)
+		if isTest {
+			args = append(args, "-c")
+		}
+		args = append(args, rest...)
+		args = append(args, "-o", debugname, "-gcflags", "all=-N -l")
+		return append(args, pkgs...), nil
 	default:
 		return nil, fmt.Errorf("invalid buildflags type %T", buildflags)
 	}
 
-	args = append(args, "-o", debugname)
 	if isTest {
-		args = append([]string{"-c"}, args...)
+		args = append(args, "-c")
 	}
+	args = append(args, "-o", debugname)
 	args = append(args, "-gcflags", "all=-N -l")
 	return append(args, pkgs...), nil
+}
+
+func splitLeadingGoDir(args []string) (leading, rest []string) {
+	if len(args) >= 2 && args[0] == "-C" {
+		return args[:2], args[2:]
+	}
+	if len(args) >= 1 && strings.HasPrefix(args[0], "-C=") {
+		return args[:1], args[1:]
+	}
+	return nil, args
 }
 
 func gocommandRun(command string, args ...string) error {

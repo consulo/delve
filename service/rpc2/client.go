@@ -169,7 +169,7 @@ func (c *RPCClient) drainEvents() <-chan struct{} {
 			}
 			for _, event := range out.Events {
 				c.eventsFn(&event)
-				if event.Kind == api.EventStopped {
+				if event.Kind == api.EventStopped || event.Kind == api.EventDownloadLibraryInfoDone {
 					return
 				}
 			}
@@ -266,9 +266,9 @@ func (c *RPCClient) Halt() (*api.DebuggerState, error) {
 	return &out.State, err
 }
 
-func (c *RPCClient) GetBufferedTracepoints() ([]api.TracepointResult, error) {
+func (c *RPCClient) GetBufferedTracepoints(loadCfg *api.LoadConfig) ([]api.TracepointResult, error) {
 	var out GetBufferedTracepointsOut
-	err := c.call("GetBufferedTracepoints", GetBufferedTracepointsIn{}, &out)
+	err := c.call("GetBufferedTracepoints", GetBufferedTracepointsIn{LoadCfg: loadCfg}, &out)
 	return out.TracepointResults, err
 }
 
@@ -292,6 +292,15 @@ func (c *RPCClient) CreateBreakpoint(breakPoint *api.Breakpoint) (*api.Breakpoin
 	var out CreateBreakpointOut
 	err := c.call("CreateBreakpoint", CreateBreakpointIn{*breakPoint, "", nil, false}, &out)
 	return &out.Breakpoint, err
+}
+
+// SetExecutionPoint sets the next instruction to be executed by the current
+// thread to the instruction at addr, without executing any of the
+// instructions in between (also known as "set next statement" or "jump").
+func (c *RPCClient) SetExecutionPoint(addr uint64) (*api.DebuggerState, error) {
+	var out SetExecutionPointOut
+	err := c.call("SetExecutionPoint", SetExecutionPointIn{Addr: addr}, &out)
+	return &out.State, err
 }
 
 // CreateBreakpointWithExpr is like CreateBreakpoint but will also set a
@@ -373,9 +382,9 @@ func (c *RPCClient) EvalVariable(scope api.EvalScope, expr string, cfg api.LoadC
 	return out.Variable, err
 }
 
-func (c *RPCClient) SetVariable(scope api.EvalScope, symbol, value string) error {
+func (c *RPCClient) SetVariable(scope api.EvalScope, symbol, value string, timeout int) error {
 	out := new(SetOut)
-	return c.call("Set", SetIn{scope, symbol, value}, out)
+	return c.call("Set", SetIn{scope, symbol, value, timeout}, out)
 }
 
 func (c *RPCClient) ListSources(filter string) ([]string, error) {
@@ -706,7 +715,7 @@ func (c *RPCClient) CancelDownloads() error {
 
 func (c *RPCClient) DownloadLibraryDebugInfo(n int) error {
 	out := DownloadLibraryDebugInfoOut{}
-	return c.call("DownloadLibraryDebugInfo", DownloadLibraryDebugInfoIn{n}, out)
+	return c.callWhileDrainingEvents("DownloadLibraryDebugInfo", DownloadLibraryDebugInfoIn{n, c.eventsFn != nil}, &out)
 }
 
 func (c *RPCClient) TypeInfo(name string) (*api.TypeInfo, error) {

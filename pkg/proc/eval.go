@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -22,11 +23,16 @@ import (
 	"github.com/go-delve/delve/pkg/proc/evalop"
 )
 
-var errOperationOnSpecialFloat = errors.New("operations on non-finite floats not implemented")
+var (
+	errOperationOnSpecialFloat = errors.New("operations on non-finite floats not implemented")
+	errEvalTimedOut            = errors.New("eval timed out")
+)
 
 const (
 	goDictionaryName = ".dict"
 	goClosurePtr     = ".closureptr"
+
+	defaultEvalTimeoutMilliseconds = 100
 )
 
 // EvalScope is the scope for variable evaluation. Contains the thread,
@@ -203,7 +209,7 @@ func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, 
 		return nil, err
 	}
 
-	stack := &evalStack{}
+	stack := &evalStack{timeout: cfg.EvalTimeout}
 
 	scope.loadCfg = &cfg
 	stack.eval(scope, ops)
@@ -490,7 +496,7 @@ func (scope *EvalScope) simpleLocals(flags localsFlags, wantedName string) ([]*V
 
 		if isCapturedVar && int(val.DeclLine) == scope.Line && scope.Fn != nil && entry.Tag == dwarf.TagVariable && (flags&localsFakeFunctionEntryScope == 0) {
 			// For variables captured by closures if we are "early" in the function
-			// read  the value from the closure struct instead of their location.
+			// read the value from the closure struct instead of their location.
 			// First check that we are actually between the entry point of the
 			// function and the end of the prologue in case the code has not been
 			// gofmt'd.
@@ -693,13 +699,13 @@ func (scope *EvalScope) setValue(dstv, srcv *Variable, srcExpr string) error {
 }
 
 // SetVariable sets the value of the named variable
-func (scope *EvalScope) SetVariable(name, value string) error {
+func (scope *EvalScope) SetVariable(name, value string, timeout int) error {
 	ops, err := evalop.CompileSet(scopeToEvalLookup{scope}, name, value, scope.evalopFlags())
 	if err != nil {
 		return err
 	}
 
-	stack := &evalStack{}
+	stack := &evalStack{timeout: timeout}
 	stack.eval(scope, ops)
 	_, err = stack.result(nil)
 	return err
@@ -874,6 +880,8 @@ type evalStack struct {
 	ops                   []evalop.Op          // program being executed
 	opidx                 int                  // program counter for the stack program
 	callInjectionContinue bool                 // when set program execution suspends and the call injection protocol is executed instead
+	timeout               int                  // timeout in milliseconds, defaults to 100ms
+	tstart                time.Time
 	err                   error
 
 	spoff, bpoff, fboff int64
@@ -917,7 +925,9 @@ func (s *evalStack) fncallPeek() *functionCallState {
 
 func (s *evalStack) pushErr(v *Variable, err error) {
 	s.err = err
-	s.stack = append(s.stack, v)
+	if err == nil {
+		s.stack = append(s.stack, v)
+	}
 }
 
 // eval evaluates ops. When it returns if callInjectionContinue is set the
@@ -1014,6 +1024,11 @@ func (stack *evalStack) resume(g *G) {
 }
 
 func (stack *evalStack) run() {
+	if stack.timeout <= 0 {
+		stack.timeout = defaultEvalTimeoutMilliseconds
+	}
+	stack.tstart = time.Now()
+
 	scope, curthread := stack.scope, stack.curthread
 	for stack.opidx < len(stack.ops) && stack.err == nil {
 		stack.callInjectionContinue = false
@@ -1149,27 +1164,30 @@ func (stack *evalStack) executeOp() {
 		stack.push(nilVariable)
 
 	case *evalop.PushPackageVarOrSelect:
-		v, err := scope.findGlobal(op.Name, op.Sel)
-		if err != nil && !isSymbolNotFound(err) {
-			stack.err = err
-			return
-		}
-		if v != nil {
-			stack.push(v)
-		} else {
-			if op.NameIsString {
-				stack.err = fmt.Errorf("%q (type string) is not a struct", op.Name)
-				return
-			}
-			found := stack.pushIdent(scope, op.Name)
+		var savedErr error
+		found := false
+		if !op.NameIsString {
+			found = stack.pushIdent(scope, op.Name)
 			if stack.err != nil {
-				return
+				savedErr = stack.err
+				stack.err = nil
+				found = false
 			}
 			if found {
 				scope.evalStructSelector(&evalop.Select{Name: op.Sel}, stack)
-			} else {
-				stack.err = fmt.Errorf("could not find symbol value for %s", op.Name)
+				if stack.err != nil {
+					savedErr = stack.err
+					stack.err = nil
+					found = false
+				}
 			}
+		}
+		if !found {
+			v, err := scope.findGlobal(op.Name, op.Sel)
+			if err != nil && savedErr != nil {
+				err = savedErr
+			}
+			stack.pushErr(v, err)
 		}
 
 	case *evalop.PushIdent:
@@ -1218,7 +1236,7 @@ func (stack *evalStack) executeOp() {
 			stack.err = errors.New("internal debugger error: expected boolean")
 			return
 		}
-		x.loadValue(loadFullValue)
+		x.loadValue(LoadFullValue())
 		stack.push(newConstant(x.Value, scope.BinInfo, scope.Mem))
 
 	case *evalop.Pop:
@@ -1498,7 +1516,7 @@ func (scope *EvalScope) evalJump(op *evalop.Jump, stack *evalStack) {
 		}
 		return
 	}
-	x.loadValue(loadFullValue)
+	x.loadValue(LoadFullValue())
 	if x.Unreadable != nil {
 		stack.err = x.Unreadable
 		return
@@ -1653,7 +1671,7 @@ func (scope *EvalScope) evalTypeCast(op *evalop.TypeCast, stack *evalStack) {
 		}
 	}
 
-	cfg := loadFullValue
+	cfg := LoadFullValue()
 	if scope.loadCfg != nil {
 		cfg = *scope.loadCfg
 	}
@@ -1904,7 +1922,7 @@ func capBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 	case reflect.Slice:
 		return newConstant(constant.MakeInt64(arg.Cap), arg.bi, arg.mem), nil
 	case reflect.Chan:
-		arg.loadValue(loadFullValue)
+		arg.loadValue(LoadFullValue())
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
@@ -1937,7 +1955,7 @@ func lenBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 		}
 		return newConstant(constant.MakeInt64(arg.Len), arg.bi, arg.mem), nil
 	case reflect.Chan:
-		arg.loadValue(loadFullValue)
+		arg.loadValue(LoadFullValue())
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
@@ -2061,7 +2079,7 @@ func minmaxBuiltin(name string, op token.Token, args []*Variable, nodeargs []ast
 		if args[i].Kind == reflect.String {
 			args[i].loadValue(loadFullValueLongerStrings)
 		} else {
-			args[i].loadValue(loadFullValue)
+			args[i].loadValue(LoadFullValue())
 		}
 
 		if args[i].Unreadable != nil {
@@ -2126,7 +2144,7 @@ func (scope *EvalScope) evalTypeAssert(op *evalop.TypeAssert, stack *evalStack) 
 		stack.err = fmt.Errorf("expression %q not an interface", astutil.ExprToString(op.Node.X))
 		return
 	}
-	xv.loadInterface(0, false, loadFullValue)
+	xv.loadInterface(0, false, LoadFullValue())
 	if xv.Unreadable != nil {
 		stack.err = xv.Unreadable
 		return
@@ -2224,12 +2242,14 @@ func (scope *EvalScope) evalIndex(op *evalop.Index, stack *evalStack) {
 		return
 
 	case reflect.Map:
-		idxev.loadValue(loadFullValue)
+		idxev.loadValue(LoadFullValue())
 		if idxev.Unreadable != nil {
 			stack.err = idxev.Unreadable
 			return
 		}
-		stack.pushErr(xev.mapAccess(idxev))
+		stack.pushErr(xev.mapAccess(idxev, func() bool {
+			return time.Since(stack.tstart) > time.Duration(stack.timeout)*time.Millisecond
+		}))
 		return
 	default:
 		stack.err = cantindex
@@ -2490,14 +2510,14 @@ func (scope *EvalScope) evalBinary(binop *evalop.Binary, stack *evalStack) {
 	xv := stack.pop()
 
 	if xv.Kind != reflect.String { // delay loading strings until we use them
-		xv.loadValue(loadFullValue)
+		xv.loadValue(LoadFullValue())
 	}
 	if xv.Unreadable != nil {
 		stack.err = xv.Unreadable
 		return
 	}
 	if yv.Kind != reflect.String { // delay loading strings until we use them
-		yv.loadValue(loadFullValue)
+		yv.loadValue(LoadFullValue())
 	}
 	if yv.Unreadable != nil {
 		stack.err = yv.Unreadable
@@ -2877,13 +2897,13 @@ func (v *Variable) sliceAccess(idx int) (*Variable, error) {
 	return v.newVariable("", v.Base+uint64(int64(idx)*v.stride), v.fieldType, mem), nil
 }
 
-func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
+func (v *Variable) mapAccess(idx *Variable, timedOut func() bool) (*Variable, error) {
 	it := v.mapIterator(0)
 	if it == nil {
 		return nil, fmt.Errorf("can not access unreadable map: %v", v.Unreadable)
 	}
 
-	lcfg := loadFullValue
+	lcfg := LoadFullValue()
 	if idx.Kind == reflect.String && int64(len(constant.StringVal(idx.Value))) == idx.Len && idx.Len > int64(lcfg.MaxStringLen) {
 		// If the index is a string load as much of the keys to at least match the length of the index.
 		//TODO(aarzilli): when struct literals are implemented this needs to be
@@ -2892,7 +2912,7 @@ func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
 	}
 
 	first := true
-	for it.next() {
+	for it.next(timedOut) {
 		key := it.key()
 		key.loadValue(lcfg)
 		if key.Unreadable != nil {
@@ -2914,6 +2934,9 @@ func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
 	}
 	if v.Unreadable != nil {
 		return nil, v.Unreadable
+	}
+	if timedOut() {
+		return nil, errEvalTimedOut
 	}
 	// go would return zero for the map value type here, we do not have the ability to create zeroes
 	return nil, errors.New("key not found")

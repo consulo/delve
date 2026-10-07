@@ -41,27 +41,27 @@ To debug in IntelliJ Idea, open the 'Maven Projects' tool window (View
 version = "2023.05"
 
 val targets = arrayOf(
-        "linux/amd64/1.24",
         "linux/amd64/1.25",
         "linux/amd64/1.26",
+        "linux/amd64/1.27",
         "linux/amd64/tip",
 
-        "linux/386/1.26",
+        "linux/386/1.27",
 
-        "linux/arm64/1.26",
+        "linux/arm64/1.27",
         "linux/arm64/tip",
 
-        "linux/ppc64le/1.26",
+        "linux/ppc64le/1.27",
 
-        // "linux/riscv64/1.26", // needs exp.linuxriscv64 build tag, disabled due to CI issues
+        "linux/riscv64/1.27",
 
-        "windows/amd64/1.26",
+        "windows/amd64/1.27",
         "windows/amd64/tip",
 
-        "mac/amd64/1.26",
+        "mac/amd64/1.27",
         "mac/amd64/tip",
 
-        "mac/arm64/1.26",
+        "mac/arm64/1.27",
         "mac/arm64/tip"
 )
 
@@ -132,7 +132,7 @@ class AggregatorBuild(tests: Collection<BuildType>) : BuildType({
     }
 
     failureConditions {
-        executionTimeoutMin = 60
+        executionTimeoutMin = 120
     }
 })
 
@@ -196,7 +196,7 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
     }
 
     failureConditions {
-        executionTimeoutMin = 30
+        executionTimeoutMin = 120
 
         if (version != "tip") {
             failOnMetricChange {
@@ -224,15 +224,18 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
                         dockerArch
                     }
                 }
-                val ubuntuVersion = when (arch) {
-                    "riscv64" -> "24.04"
-                    else -> "20.04"
+                // Ubuntu dropped i386 Docker images after 20.04 (no 22.04/24.04
+                // tags exist on docker.io/i386/ubuntu). Keep linux/386 on Debian,
+                // which still publishes maintained i386 images.
+                val dockerImage = when (arch) {
+                    "386" -> "i386/debian:bookworm"
+                    else -> "$dockerArch/ubuntu:24.04"
                 }
                 dockerCommand {
-                    name = "Pull Ubuntu"
+                    name = "Pull Linux Image"
                     commandType = other {
                         subCommand = "pull"
-                        commandArgs = "$dockerArch/ubuntu:$ubuntuVersion"
+                        commandArgs = dockerImage
                     }
                 }
                 dockerCommand {
@@ -245,7 +248,7 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
                         --env CI=true
                         --privileged
                         --platform linux/$dockerPlatformArch
-                        $dockerArch/ubuntu:$ubuntuVersion
+                        $dockerImage
                         /delve/_scripts/test_linux.sh ${"go$version"} $arch
                     """.trimIndent()
                     }

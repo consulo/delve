@@ -30,6 +30,7 @@ import (
 	"github.com/cosiner/argv"
 	"github.com/go-delve/delve/pkg/config"
 	"github.com/go-delve/delve/pkg/locspec"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
@@ -93,7 +94,10 @@ var (
 	// * Follows pointers
 	// * Loads more array values
 	// * Does not limit struct fields
-	longLoadConfig = api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+	longLoadConfig = func() api.LoadConfig {
+		c := proc.LoadFullValue()
+		return *api.LoadConfigFromProc(&c)
+	}()
 	// ShortLoadConfig loads less information, not following pointers
 	// and limiting struct fields loaded to 3.
 	ShortLoadConfig = api.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
@@ -156,7 +160,7 @@ See also: "help on", "help cond" and "help clear"`},
 
 The memory location is specified with the same expression language used by 'print', for example:
 
-	watch v
+	watch -r v
 	watch -w *(*int)(0x1400007c018)
 
 will watch the address of variable 'v' and writes to an int at addr '0x1400007c018'.
@@ -223,6 +227,19 @@ Current limitations:
 - calling a function will resume execution of all goroutines.
 - only supported on linux's native backend.
 `},
+		{aliases: []string{"jump", "j"}, group: runCmds, cmdFn: setNextStatement, helpMsg: `Set the next instruction to be executed (EXPERIMENTAL!!!).
+
+	jump <linespec>
+
+Sets the next instruction to be executed to the location given by <linespec>,
+without executing any of the instructions in between (also known as "set next
+statement"). The target must be inside the current function.
+
+WARNING: this is unsafe. Even with optimizations disabled the compiler
+reorders instructions and inserts hidden initialization, so skipping over code
+can skip setup that later instructions rely on.
+
+See also: "help locspec".`},
 		{aliases: []string{"threads"}, group: goroutineCmds, cmdFn: threads, helpMsg: "Print out info for every traced thread."},
 		{aliases: []string{"thread", "tr"}, group: goroutineCmds, cmdFn: thread, helpMsg: `Switch to the specified thread.
 
@@ -399,9 +416,11 @@ If regex is specified only package variables with a name matching it will be ret
 Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See Documentation/cli/expr.md.`},
 		{aliases: []string{"exit", "quit", "q"}, cmdFn: exitCommand, helpMsg: `Exit the debugger.
 
-	exit [-c]
+	exit [-c] [-d]
 
-When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.`},
+When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.
+
+Pass -d to detach from the target process, leaving it running, without being prompted whether to kill it.`},
 		{aliases: []string{"list", "ls", "l"}, cmdFn: listCommand, helpMsg: `Show source code.
 
 	[goroutine <n>] [frame <m>] list [<locspec>]
@@ -546,7 +565,7 @@ Saves the configuration file to disk, overwriting the current configuration file
 
 Changes the value of simple configuration parameters.
 
-Use 'help config <parameter>' for more informations on specific configuration options.
+Use 'help config <parameter>' for more information on specific configuration options.
 `},
 
 		{aliases: []string{"edit", "ed"}, cmdFn: edit, helpMsg: `Open where you are in $DELVE_EDITOR or $EDITOR
@@ -694,16 +713,20 @@ func (c *Commands) Find(cmdstr string, prefix cmdPrefix) command {
 		return command{aliases: []string{"nullcmd"}, cmdFn: nullCommand}
 	}
 
+	cmd, _ := c.findInternal(cmdstr, prefix)
+	return cmd
+}
+
+func (c *Commands) findInternal(cmdstr string, prefix cmdPrefix) (command, bool) {
 	for _, v := range c.cmds {
 		if v.match(cmdstr) {
 			if prefix != noPrefix && v.allowedPrefixes&prefix == 0 {
 				continue
 			}
-			return v
+			return v, true
 		}
 	}
-
-	return command{aliases: []string{"nocmd"}, cmdFn: noCmdAvailable}
+	return command{aliases: []string{"nocmd"}, cmdFn: noCmdAvailable}, false
 }
 
 // CallWithContext takes a command and a context that command should be executed in.
@@ -1509,6 +1532,29 @@ func stepInstruction(t *Term, ctx callContext, frame int, skipCalls bool) error 
 	return nil
 }
 
+func setNextStatement(t *Term, ctx callContext, args string) error {
+	if args == "" {
+		return errors.New("jump requires a location")
+	}
+
+	locs, _, err := t.client.FindLocation(ctx.Scope, args, false, t.substitutePathRules())
+	if err != nil {
+		return err
+	}
+	if len(locs) != 1 {
+		return errors.New("can not jump to a location that resolves to multiple addresses")
+	}
+
+	state, err := t.client.SetExecutionPoint(locs[0].PC)
+	if err != nil {
+		return err
+	}
+
+	printcontext(t, state)
+	printPos(t, state.CurrentThread, printPosShowArrow)
+	return nil
+}
+
 func (c *Commands) revCmd(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
 		return errors.New("not enough arguments")
@@ -2175,7 +2221,7 @@ func (c *Commands) printVar(t *Term, ctx callContext, args string) error {
 
 	t.stdout.pw.PageMaybe(nil)
 
-	fmt.Fprintln(t.stdout, val.StringWithOptions("", fmtstr, api.PrettyNewlines))
+	fmt.Fprintln(t.stdout, val.StringWithOptions("", fmtstr, api.PrettyNewlines|t.rawStringFlag()))
 
 	if val.Kind == reflect.Chan {
 		fmt.Fprintln(t.stdout)
@@ -2259,7 +2305,7 @@ func setVar(t *Term, ctx callContext, args string) error {
 
 	lexpr := args[:el[0].Pos.Offset]
 	rexpr := args[el[0].Pos.Offset+1:]
-	return t.client.SetVariable(ctx.Scope, lexpr, rexpr)
+	return t.client.SetVariable(ctx.Scope, lexpr, rexpr, t.evalTimeout())
 }
 
 func (t *Term) printFilteredVariables(varType string, vars []api.Variable, filter string, cfg api.LoadConfig) error {
@@ -2279,7 +2325,7 @@ func (t *Term) printFilteredVariables(varType string, vars []api.Variable, filte
 			if cfg == ShortLoadConfig {
 				fmt.Fprintf(t.stdout, "%s = %s\n", name, v.SinglelineString())
 			} else {
-				fmt.Fprintf(t.stdout, "%s = %s\n", name, multiLineVar(&v, ""))
+				fmt.Fprintf(t.stdout, "%s = %s\n", name, t.multiLineVar(&v, ""))
 			}
 		}
 	}
@@ -2682,11 +2728,10 @@ func libraries(t *Term, ctx callContext, args string) error {
 			if err != nil {
 				return err
 			}
-			t.client.DownloadLibraryDebugInfo(n)
+			return t.client.DownloadLibraryDebugInfo(n)
 		default:
 			return errors.New("wrong arguments")
 		}
-		return nil
 	}
 
 	libs, _, err := t.client.ListDynamicLibraries()
@@ -2796,7 +2841,7 @@ func printReturnValues(t *Term, th *api.Thread) {
 	}
 	fmt.Fprintln(t.stdout, "Values returned:")
 	for _, v := range th.ReturnValues {
-		fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, multiLineVar(&v, "\t"))
+		fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, t.multiLineVar(&v, "\t"))
 	}
 	fmt.Fprintln(t.stdout)
 }
@@ -2927,13 +2972,13 @@ func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
 
 	for _, v := range bpi.Variables {
 		tracepointnl()
-		fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, multiLineVar(&v, "\t"))
+		fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, t.multiLineVar(&v, "\t"))
 	}
 
 	for _, v := range bpi.Locals {
 		tracepointnl()
 		if *bp.LoadLocals == longLoadConfig {
-			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, multiLineVar(&v, "\t"))
+			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, t.multiLineVar(&v, "\t"))
 		} else {
 			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, v.SinglelineString())
 		}
@@ -2942,7 +2987,7 @@ func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
 	if bp.LoadArgs != nil && *bp.LoadArgs == longLoadConfig {
 		for _, v := range bpi.Arguments {
 			tracepointnl()
-			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, multiLineVar(&v, "\t"))
+			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, t.multiLineVar(&v, "\t"))
 		}
 	}
 	if bpi.Stacktrace != nil {
@@ -3148,7 +3193,8 @@ func (ere ExitRequestError) Error() string {
 }
 
 func exitCommand(t *Term, ctx callContext, args string) error {
-	if args == "-c" {
+	switch args {
+	case "-c":
 		if !t.client.IsMulticlient() {
 			return errors.New("not connected to an --accept-multiclient server")
 		}
@@ -3167,6 +3213,12 @@ func exitCommand(t *Term, ctx callContext, args string) error {
 			}
 		}
 		t.quitContinue = true
+	case "-d":
+		t.detachNoKill = true
+	case "":
+		// no arguments
+	default:
+		return fmt.Errorf("unknown argument %q to exit", args)
 	}
 	return ExitRequestError{}
 }
@@ -3636,6 +3688,6 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
 	return out.String()
 }
 
-func multiLineVar(v *api.Variable, indent string) string {
-	return v.StringWithOptions(indent, "", api.PrettyNewlines)
+func (t *Term) multiLineVar(v *api.Variable, indent string) string {
+	return v.StringWithOptions(indent, "", api.PrettyNewlines|t.rawStringFlag())
 }

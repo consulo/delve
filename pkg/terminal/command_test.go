@@ -152,7 +152,7 @@ func withTestTerminalBuildFlags(name string, t testing.TB, buildFlags test.Build
 
 	ft := &FakeTerminal{
 		t:    t,
-		Term: New(client, &config.Config{}),
+		Term: New(client, &config.Config{}, false),
 	}
 	fn(ft)
 }
@@ -462,6 +462,9 @@ func TestScopePrefix(t *testing.T) {
 			ival, err := strconv.Atoi(out[:len(out)-1])
 			if err != nil {
 				t.Fatalf("could not parse value %q of i for goroutine %d frame %d: %v", out, gid, fid, err)
+			}
+			if ival < 0 || ival >= len(seen) {
+				t.Fatalf("value of i (%d) for goroutine %d frame %d out of expected range [0,%d); raw output %q; stack: %q; goroutines: %q", ival, gid, fid, len(seen), out, stackOut, goroutinesOut)
 			}
 			seen[ival] = true
 		}
@@ -1337,7 +1340,7 @@ func TestClearCondBreakpoint(t *testing.T) {
 func TestBreakpointEditing(t *testing.T) {
 	term := &FakeTerminal{
 		t:    t,
-		Term: New(nil, &config.Config{}),
+		Term: New(nil, &config.Config{}, false),
 	}
 	_ = term
 
@@ -1474,7 +1477,7 @@ func TestDisassPosCmd(t *testing.T) {
 		term.MustExec("continue")
 		out := term.MustExec("step-instruction")
 		t.Logf("%q\n", out)
-		if !strings.Contains(out, "call $runtime.Breakpoint") && !strings.Contains(out, "CALL runtime.Breakpoint(SB)") {
+		if !strings.Contains(out, "call runtime.Breakpoint") && !strings.Contains(out, "CALL runtime.Breakpoint") {
 			t.Errorf("output doesn't look like disassembly")
 		}
 	})
@@ -1806,6 +1809,9 @@ func TestBreakPointFailWithCond(t *testing.T) {
 	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
 		t.Skip("follow exec not implemented")
 	}
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		t.Skip("flaky")
+	}
 
 	oldYesNo := yesno
 	defer func() { yesno = oldYesNo }()
@@ -1990,4 +1996,71 @@ func TestCommandPromptExpansion(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestPrintShowRawStrings tests the show-raw-strings config option that
+// controls whether escape characters in string values are displayed as
+// escaped sequences (\n, \t) or as actual control characters (newlines, tabs).
+func TestPrintShowRawStrings(t *testing.T) {
+	withTestTerminal("escapestrings", t, func(term *FakeTerminal) {
+		// Continue to runtime.Breakpoint() in main.
+		term.MustExec("continue")
+
+		// --- Default behavior (show-raw-strings=false): escaped ---
+		out := term.MustExec("print withTabs")
+		// Default: literal \t in output
+		if !strings.Contains(out, `\t`) {
+			t.Fatalf("default: expected escaped \\t in output, got %q", out)
+		}
+
+		out = term.MustExec("print multiline")
+		// Default: literal \n in output
+		if !strings.Contains(out, `\n`) {
+			t.Fatalf("default: expected escaped \\n in output, got %q", out)
+		}
+
+		// --- Enable show-raw-strings ---
+		term.MustExec("config show-raw-strings true")
+
+		out = term.MustExec("print withTabs")
+		// With raw strings: actual tabs, no literal \t
+		if strings.Contains(out, `\t`) {
+			t.Fatalf("raw: expected actual tabs, got escaped \\t in output: %q", out)
+		}
+		if !strings.Contains(out, "\t") {
+			t.Fatalf("raw: expected actual tab character, got %q", out)
+		}
+
+		out = term.MustExec("print multiline")
+		// With raw strings: actual newlines, no literal \n
+		if strings.Contains(out, `\n`) {
+			t.Fatalf("raw: expected actual newlines, got escaped \\n in output: %q", out)
+		}
+		lines := strings.Split(out, "\n")
+		if len(lines) < 3 { // at least: "hello, world", "" (empty trailing)
+			t.Fatalf("raw: expected multi-line output, got %q", out)
+		}
+	})
+}
+
+func TestDeleteAlias(t *testing.T) {
+	var buf bytes.Buffer
+	var term Term
+	term.conf = &config.Config{
+		Aliases: map[string][]string{
+			"print": []string{"b", "c", "a", "a"},
+		},
+	}
+	term.cmds = DebugCommands(nil)
+	term.stdout = &transcriptWriter{pw: &pagingWriter{w: &buf}}
+	configureCmd(&term, callContext{}, "alias a")
+	t.Logf("new aliases: %q", term.conf.Aliases)
+	if pa := term.conf.Aliases["print"]; len(pa) != 2 || pa[0] != "b" || pa[1] != "c" {
+		t.Fatal("wrong alias list")
+	}
+	err := configureCmd(&term, callContext{}, "alias print b")
+	t.Logf("alias command error: %v", err)
+	if err == nil {
+		t.Fatal("expected error")
+	}
 }

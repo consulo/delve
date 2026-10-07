@@ -250,7 +250,7 @@ func (t *Target) IsCgo() bool {
 	scope := globalScope(t, t.BinInfo(), t.BinInfo().Images[0], t.Memory())
 	iscgov, err := scope.findGlobal("runtime", "iscgo")
 	if err == nil {
-		iscgov.loadValue(loadFullValue)
+		iscgov.loadValue(LoadFullValue())
 		if iscgov.Unreadable == nil {
 			t.iscgo = new(bool)
 			*t.iscgo = constant.BoolVal(iscgov.Value)
@@ -352,6 +352,40 @@ func (t *Target) SwitchThread(tid int) error {
 	return fmt.Errorf("thread %d does not exist", tid)
 }
 
+// SetNextExecutionPoint sets the program counter of the current thread to
+// addr without executing any of the instructions in between, also known as
+// "set next statement" or "jump". addr must be inside the function the
+// current thread is stopped in: jumping to a different function would leave
+// the stack frame set up for the old function and corrupt execution.
+//
+// Even with optimizations disabled the compiler reorders instructions and
+// inserts hidden initialization, so skipping over code can skip setup that
+// later instructions rely on.
+func (t *Target) SetNextExecutionPoint(addr uint64) error {
+	if ok, err := t.Valid(); !ok {
+		return err
+	}
+
+	thread := t.CurrentThread()
+	regs, err := thread.Registers()
+	if err != nil {
+		return err
+	}
+
+	currentFn := t.BinInfo().PCToFunc(regs.PC())
+	destFn := t.BinInfo().PCToFunc(addr)
+	if currentFn == nil || destFn == nil || currentFn != destFn {
+		return errors.New("can not set the next execution point outside of the current function")
+	}
+
+	if err := setPC(thread, addr); err != nil {
+		return err
+	}
+
+	t.selectedGoroutine, _ = GetG(t.CurrentThread())
+	return nil
+}
+
 // setAsyncPreemptOff enables or disables async goroutine preemption by
 // writing the value 'v' to runtime.debug.asyncpreemptoff.
 // A value of '1' means off, a value of '0' means on.
@@ -376,7 +410,7 @@ func setAsyncPreemptOff(p *Target, v int64) {
 		logger.Warnf("could not find asyncpreemptoff field: %v", err)
 		return
 	}
-	asyncpreemptoffv.loadValue(loadFullValue)
+	asyncpreemptoffv.loadValue(LoadFullValue())
 	if asyncpreemptoffv.Unreadable != nil {
 		logger.Warnf("asyncpreemptoff field unreadable: %v", asyncpreemptoffv.Unreadable)
 		return
@@ -491,18 +525,19 @@ type UProbeTraceResult struct {
 	ReturnParams []*Variable
 }
 
-func (t *Target) GetBufferedTracepoints() []*UProbeTraceResult {
+func (t *Target) GetBufferedTracepoints(cfg LoadConfig) []*UProbeTraceResult {
 	var results []*UProbeTraceResult
 	tracepoints := t.proc.GetBufferedTracepoints()
 	convertInputParamToVariable := func(ip *ebpf.RawUProbeParam) *Variable {
 		v := &Variable{}
 		v.Name = ip.Name
-		v.DwarfType = ip.RealType
 		v.RealType = ip.RealType
+		v.DwarfType = ip.RealType // needed so ConstDescr doesn't panic when bi is set
 		v.Len = ip.Len
 		v.Base = ip.Base
 		v.Addr = ip.Addr
 		v.Kind = ip.Kind
+		v.bi = t.BinInfo()
 
 		if ip.Unreadable != nil {
 			v.Unreadable = ip.Unreadable
@@ -521,9 +556,7 @@ func (t *Target) GetBufferedTracepoints() []*UProbeTraceResult {
 		}
 		v.mem = compMem
 
-		// Load the value here so that we don't have to export
-		// loadValue outside of proc.
-		v.loadValue(loadFullValue)
+		v.loadValue(cfg)
 
 		return v
 	}
@@ -560,8 +593,13 @@ func (grp *TargetGroup) RequestManualStop() error {
 }
 
 const (
-	FakeAddressBase     = 0xbeef000000000000
-	fakeAddressUnresolv = 0xbeed000000000000 // this address never resolves to memory
+	FakeAddressBase = 0xbeef000000000000
+	// fakeAddressUnresolv is a sentinel base address for variables that live in
+	// fake (non-process) memory: composite memory, CPU register variables, etc.
+	// It is chosen to never resolve to a real process address.
+	// The ebpf subpackage has its own copy (fakeAddressUnresolv in helpers.go);
+	// both must stay in sync.
+	fakeAddressUnresolv = 0xbeed000000000000
 )
 
 // newCompositeMemory creates a new compositeMemory object and registers it.

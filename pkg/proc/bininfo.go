@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -48,6 +49,8 @@ const (
 	dwarfTreeCacheSize = 512  // size of the dwarfTree cache of each image
 )
 
+var linkerTrampolineName = regexp.MustCompile(`[+-][0-9a-f]+-tramp[0-9]+$`)
+
 // BinaryInfo holds information on the binaries being executed (this
 // includes both the executable and also any loaded libraries).
 type BinaryInfo struct {
@@ -59,7 +62,8 @@ type BinaryInfo struct {
 
 	DebugInfoDirectories []string
 
-	// Functions is a list of all DW_TAG_subprogram entries in debug_info, sorted by entry point
+	// Functions contains functions described by DWARF or pclntab, sorted by
+	// entry point. DWARF is preferred when both sources describe the same entry.
 	Functions []Function
 	// Sources is a list of all source files found in debug_line.
 	Sources []string
@@ -118,6 +122,7 @@ type BinaryInfo struct {
 	debugPinnerFn *Function
 	logger        logflags.Logger
 	eventsFn      func(*Event)
+	attaching     bool
 
 	cancelDownloadsMu sync.Mutex
 	cancelDownloads   func()
@@ -132,6 +137,8 @@ var (
 	// ErrNoDebugInfoFound is returned when Delve cannot open the debug_info
 	// section or find an external debug info file.
 	ErrNoDebugInfoFound = errors.New("could not open debug info")
+
+	ErrDebuginfodSkippedOnAttach = errors.New("debuginfod call skipped on attach")
 )
 
 var (
@@ -407,11 +414,52 @@ func FirstPCAfterPrologue(p Process, fn *Function, sameline bool) (uint64, error
 		// breakpoint with file:line and with the function name always result on
 		// the same instruction being selected.
 		if pc2, _, _, ok := fn.cu.lineInfo.FirstStmt(fn.Entry, fn.End); ok {
+			if p.BinInfo().Arch.Name == "ppc64le" {
+				pc2 = p.BinInfo().ppc64leSkipToLocalEntry(fn, pc2)
+			}
 			return pc2, nil
 		}
 	}
 
 	return pc, nil
+}
+
+// ppc64leSkipToLocalEntry returns the ppc64le ELFv2 local entry point of fn, clamping pc
+// forward to it when pc falls inside the function's global-entry stub.
+//
+// On ppc64le DWARF low_pc (fn.Entry) is the global entry point, which begins
+// with a TOC (r2) setup stub. However, Callers in the same module (for example
+// the cgo trampoline calling a C function) already share the TOC and enter at
+// the local entry point. A breakpoint placed at global entry point never executes.
+// gcc does not emit DW_LNS_set_prologue_end, so PrologueEndPC cannot advance past
+// the stub on its own; use the local entry offset recorded in the ELF symbol
+// instead.
+//
+// The offset is encoded in bits 5-7 of the symbol's st_other byte; see the
+// Power Architecture 64-Bit ELF V2 ABI Specification, section 3.4.1 "Symbol
+// Values" (https://openpowerfoundation.org/specifications/64bitelfabi/). The
+// decoding below matches binutils' PPC64_LOCAL_ENTRY_OFFSET macro in
+// include/elf/ppc64.h.
+
+// On other architectures, for functions without a local entry offset, or when
+// pc is already past the local entry point, this becomes a no-op.
+func (bi *BinaryInfo) ppc64leSkipToLocalEntry(fn *Function, pc uint64) uint64 {
+	if bi.Arch.Name != "ppc64le" {
+		return pc
+	}
+	// obtain symbol info using global entry point to compute local entry point
+	sym := bi.SymNames[fn.Entry]
+	if sym == nil {
+		return pc
+	}
+	// compute local entry point
+	// bits 5-7 of st_other encode the offset as ((1<<k)>>2)<<2 bytes (0,0,4,8,16,32,64).
+	bits := (sym.Other >> 5) & 0x7
+	localEntry := fn.Entry + uint64(((1<<bits)>>2)<<2)
+	if pc < localEntry {
+		return localEntry
+	}
+	return pc
 }
 
 func findRetPC(t *Target, name string) ([]uint64, error) {
@@ -526,7 +574,8 @@ type Function struct {
 	offset     dwarf.Offset
 	cu         *compileUnit
 
-	Trampoline bool // DW_AT_trampoline attribute set to true
+	Trampoline       bool   // DW_AT_trampoline attribute is present
+	TrampolineTarget uint64 // Address-valued DW_AT_trampoline, if available
 
 	// InlinedCalls lists all inlined calls to this function
 	InlinedCalls         []InlinedCall
@@ -548,35 +597,106 @@ type functionExtra struct {
 	rangeParent *Function
 }
 
-// instRange returns the indexes in fn.Name of the type parameter
-// instantiation, which is the position of the outermost '[' and ']'.
-// If fn is not an instantiated function both returned values will be len(fn.Name)
-func (fn *Function) instRange() [2]int {
-	d := len(fn.Name)
-	inst := [2]int{d, d}
-	if strings.HasPrefix(fn.Name, "type..") {
-		return inst
+// parse parses the function's name and returns package, receiver and base
+// name as well as a flag indicating whether the name has generic type
+// parameters.
+func (fn *Function) parse() (pkg, rcv, base string, hasInst bool) {
+	if fn.cu != nil && !fn.cu.isgo {
+		if strings.HasPrefix(fn.Name, "C.") {
+			return "C", "", fn.Name[2:], false
+		}
+		return "", "", fn.Name, false
 	}
-	inst[0] = strings.Index(fn.Name, "[")
-	if inst[0] < 0 {
-		inst[0] = d
-		return inst
+	if strings.HasPrefix(fn.Name, "go:") || strings.HasPrefix(fn.Name, "type:") {
+		return "", "", fn.Name, false
 	}
-	inst[1] = strings.LastIndex(fn.Name, "]")
-	if inst[1] < 0 {
-		inst[0] = d
-		inst[1] = d
-		return inst
+
+	dot1 := -1 // first '.' after the last slash at depth == 0
+	dot2 := -1 // second '.' after the last slash at depth == 0
+	depth := 0 // depth within []
+
+	for i := range len(fn.Name) {
+		if depth == 0 {
+			switch fn.Name[i] {
+			case '[':
+				depth++
+				hasInst = true
+			case '/':
+				dot1 = -1
+				dot2 = -1
+			case '.':
+				if dot1 < 0 {
+					dot1 = i
+				} else if dot2 < 0 {
+					dot2 = i
+				}
+			}
+		} else {
+			switch fn.Name[i] {
+			case '[':
+				depth++
+			case ']':
+				depth--
+			}
+		}
 	}
-	return inst
+
+	if dot1 == -1 {
+		return "", "", fn.Name, hasInst
+	}
+
+	if dot2 == -1 {
+		return fn.Name[:dot1], "", fn.Name[dot1+1:], hasInst
+	}
+
+	return fn.Name[:dot1], fn.Name[dot1+1 : dot2], fn.Name[dot2+1:], hasInst
 }
 
 // PackageName returns the package part of the symbol name,
 // or the empty string if there is none.
 // Borrowed from $GOROOT/debug/gosym/symtab.go
 func (fn *Function) PackageName() string {
-	inst := fn.instRange()
-	return packageName(fn.Name[:inst[0]])
+	pkg, _, _, _ := fn.parse()
+	return pkg
+}
+
+// ReceiverName returns the receiver type name of this symbol,
+// or the empty string if there is none.
+func (fn *Function) ReceiverName() string {
+	_, rcv, _, _ := fn.parse()
+	return rcv
+}
+
+// BaseName returns the symbol name without the package or receiver name.
+func (fn *Function) BaseName() string {
+	_, _, base, _ := fn.parse()
+	return base
+}
+
+// NameWithoutTypeParams returns the function name without instantiation parameters
+func (fn *Function) NameWithoutTypeParams() string {
+	pkg, rcv, base, hasInst := fn.parse()
+	if !hasInst || pkg == "" {
+		return fn.Name
+	}
+	rcv = clearInstParams(rcv)
+	base = clearInstParams(base)
+	if rcv == "" {
+		return pkg + "." + base
+	}
+	return pkg + "." + rcv + "." + base
+}
+
+func clearInstParams(s string) string {
+	start := strings.Index(s, "[")
+	if start < 0 {
+		return s
+	}
+	end := strings.LastIndex(s, "]")
+	if start == end {
+		return s
+	}
+	return s[:start] + s[end+1:]
 }
 
 func packageName(name string) string {
@@ -586,45 +706,6 @@ func packageName(name string) string {
 		return name[:pathend+i]
 	}
 	return ""
-}
-
-// ReceiverName returns the receiver type name of this symbol,
-// or the empty string if there is none.
-// Borrowed from $GOROOT/debug/gosym/symtab.go
-func (fn *Function) ReceiverName() string {
-	inst := fn.instRange()
-	pathend := max(strings.LastIndex(fn.Name[:inst[0]], "/"), 0)
-	l := strings.Index(fn.Name[pathend:], ".")
-	if l == -1 {
-		return ""
-	}
-	if r := strings.LastIndex(fn.Name[inst[1]:], "."); r != -1 && pathend+l != inst[1]+r {
-		return fn.Name[pathend+l+1 : inst[1]+r]
-	} else if r := strings.LastIndex(fn.Name[pathend:inst[0]], "."); r != -1 && l != r {
-		return fn.Name[pathend+l+1 : pathend+r]
-	}
-	return ""
-}
-
-// BaseName returns the symbol name without the package or receiver name.
-// Borrowed from $GOROOT/debug/gosym/symtab.go
-func (fn *Function) BaseName() string {
-	inst := fn.instRange()
-	if i := strings.LastIndex(fn.Name[inst[1]:], "."); i != -1 {
-		return fn.Name[inst[1]+i+1:]
-	} else if i := strings.LastIndex(fn.Name[:inst[0]], "."); i != -1 {
-		return fn.Name[i+1:]
-	}
-	return fn.Name
-}
-
-// NameWithoutTypeParams returns the function name without instantiation parameters
-func (fn *Function) NameWithoutTypeParams() string {
-	inst := fn.instRange()
-	if inst[0] == inst[1] {
-		return fn.Name
-	}
-	return fn.Name[:inst[0]] + fn.Name[inst[1]+1:]
 }
 
 // Optimized returns true if the function was optimized by the compiler.
@@ -685,7 +766,7 @@ func (fn *Function) CompilationUnitName() string {
 
 func rangeParentName(fnname string) int {
 	const rangeSuffix = "-range"
-	ridx := strings.Index(fnname, rangeSuffix)
+	ridx := strings.LastIndex(fnname, rangeSuffix)
 	if ridx <= 0 {
 		return -1
 	}
@@ -698,6 +779,9 @@ func rangeParentName(fnname string) int {
 	}
 	if !ok {
 		return -1
+	}
+	if ridx2 := rangeParentName(fnname[:ridx]); ridx2 > 0 {
+		return ridx2
 	}
 	return ridx
 }
@@ -835,8 +919,8 @@ type ElfDynamicSection struct {
 }
 
 // NewBinaryInfo returns an initialized but unloaded BinaryInfo struct.
-func NewBinaryInfo(goos, goarch string) *BinaryInfo {
-	r := &BinaryInfo{GOOS: goos, logger: logflags.DebuggerLogger()}
+func NewBinaryInfo(goos, goarch string, attaching bool) *BinaryInfo {
+	r := &BinaryInfo{GOOS: goos, logger: logflags.DebuggerLogger(), attaching: attaching}
 
 	// TODO: find better way to determine proc arch (perhaps use executable file info).
 	switch goarch {
@@ -1117,8 +1201,18 @@ func (bi *BinaryInfo) AddImage(path string, addr uint64) error {
 	return err
 }
 
+// ResetDownloadsContext resets the downloads context. If the context was
+// cancelled before this BinaryInfo object will be able to do downloads
+// again.
+func (bi *BinaryInfo) ResetDownloadsContext() {
+	bi.cancelDownloadsMu.Lock()
+	bi.downloadsCtx, bi.cancelDownloads = context.WithCancel(context.Background())
+	bi.cancelDownloadsMu.Unlock()
+}
+
 // LoadImageBinaryInfoAgain loads the n-th image debug symbols if they weren't already loaded.
 func (bi *BinaryInfo) LoadImageBinaryInfoAgain(n int) error {
+	bi.attaching = false
 	if n < 0 || n >= len(bi.Images) || bi.Images[n].loadErr == nil {
 		return nil
 	}
@@ -1641,6 +1735,9 @@ func (bi *BinaryInfo) openSeparateDebugInfo(image *Image, exe *elf.File, debugIn
 				})
 			}
 		}
+		if bi.attaching {
+			return nil, nil, ErrDebuginfodSkippedOnAttach
+		}
 		debugFilePath, err = debuginfod.GetDebuginfo(bi.downloadsCtx, notify, image.BuildID)
 		if err != nil {
 			return nil, nil, ErrNoDebugInfoFound
@@ -1716,6 +1813,9 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 			}
 			err := loadBinaryInfoGoRuntimeElf(bi, image, path, elfFile)
 			if err != nil {
+				if serr == ErrDebuginfodSkippedOnAttach {
+					return serr
+				}
 				return fmt.Errorf("could not read debug info (%v) and could not read go symbol table (%v)", dwerr, err)
 			}
 			image.IsGo = true
@@ -1727,6 +1827,7 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 			return err
 		}
 	}
+	loadBinaryInfoGoRuntimeSymTableElf(image, path, elfFile)
 
 	debugInfoBytes, err = godwarf.GetDebugSectionElf(dwarfFile, "info")
 	if err != nil {
@@ -1817,7 +1918,8 @@ func (bi *BinaryInfo) loadSymbolName(image *Image, file *elf.File, wg *sync.Wait
 	}
 	symSecs, _ := file.Symbols()
 	for _, symSec := range symSecs {
-		if symSec.Info == _STT_FUNC { // TODO(chainhelen), need to parse others types.
+		// match the st_info type bits so global and weak functions are included, not just local ones
+		if elf.ST_TYPE(symSec.Info) == _STT_FUNC { // TODO(chainhelen), need to parse others types.
 			s := symSec
 			bi.SymNames[symSec.Value+image.StaticBase] = &s
 		}
@@ -2130,6 +2232,7 @@ func loadBinaryInfoMacho(bi *BinaryInfo, image *Image, path string, entryPoint u
 		}
 		return nil
 	}
+	loadBinaryInfoGoRuntimeSymTableMacho(image, path, exe)
 	debugInfoBytes, err := godwarf.GetDebugSectionMacho(exe, "info")
 	if err != nil {
 		return err
@@ -2315,6 +2418,36 @@ func macOSShortSectionNamesWorkaround(exe *macho.File) {
 
 // GO RUNTIME INFO ////////////////////////////////////////////////////////////
 
+// loadBinaryInfoGoRuntimeSymTableElf loads pclntab when it is present. Errors
+// are ignored because this is also called for binaries that were not produced
+// by the Go toolchain.
+func loadBinaryInfoGoRuntimeSymTableElf(image *Image, path string, elfFile *elf.File) {
+	defer func() {
+		if recover() != nil {
+			logflags.Bug.Inc()
+		}
+	}()
+	symTable, _, err := readPcLnTableElf(elfFile, path)
+	if err == nil {
+		image.symTable = symTable
+	}
+}
+
+// loadBinaryInfoGoRuntimeSymTableMacho loads pclntab when it is present. Errors
+// are ignored because this is also called for binaries that were not produced
+// by the Go toolchain.
+func loadBinaryInfoGoRuntimeSymTableMacho(image *Image, path string, exe *macho.File) {
+	defer func() {
+		if recover() != nil {
+			logflags.Bug.Inc()
+		}
+	}()
+	symTable, _, err := readPcLnTableMacho(exe, path)
+	if err == nil {
+		image.symTable = symTable
+	}
+}
+
 // loadBinaryInfoGoRuntimeElf loads information from the Go runtime sections
 // of an ELF binary, it is only called when debug info has been stripped.
 func loadBinaryInfoGoRuntimeElf(bi *BinaryInfo, image *Image, path string, elfFile *elf.File) (err error) {
@@ -2467,6 +2600,49 @@ func loadBinaryInfoGoRuntimeCommon(bi *BinaryInfo, image *Image, cu *compileUnit
 	return nil
 }
 
+// addPcLnTrampolineFunctions adds linker-generated trampolines that do not have
+// a corresponding DWARF entry. Function names are compared within one image;
+// entry PCs and ranges prevent aliases or externally inserted functions from
+// creating overlapping entries. DWARF remains authoritative when both sources
+// describe the same function.
+func (bi *BinaryInfo) addPcLnTrampolineFunctions(image *Image) {
+	if image.symTable == nil {
+		return
+	}
+
+	staticBase := image.StaticBase
+	cu := &compileUnit{isgo: true, image: image}
+	merged := make([]Function, 0, len(bi.Functions))
+	dwarfIndex := 0
+	var previousDwarfEnd uint64
+	for i := range image.symTable.Funcs {
+		f := &image.symTable.Funcs[i]
+		if !linkerTrampolineName.MatchString(f.Name) {
+			continue
+		}
+		entry := f.Entry + staticBase
+		end := f.End + staticBase
+		for dwarfIndex < len(bi.Functions) && bi.Functions[dwarfIndex].Entry < entry {
+			previousDwarfEnd = max(previousDwarfEnd, bi.Functions[dwarfIndex].End)
+			merged = append(merged, bi.Functions[dwarfIndex])
+			dwarfIndex++
+		}
+		overlapsPrevious := previousDwarfEnd > entry
+		overlapsNext := dwarfIndex < len(bi.Functions) && bi.Functions[dwarfIndex].Entry < end
+		if overlapsPrevious || overlapsNext {
+			continue
+		}
+		merged = append(merged, Function{
+			Name:       f.Name,
+			Entry:      entry,
+			End:        end,
+			Trampoline: true,
+			cu:         cu,
+		})
+	}
+	bi.Functions = append(merged, bi.Functions[dwarfIndex:]...)
+}
+
 // FindType returns the requested type. The full type name must be used.
 func (bi *BinaryInfo) FindType(name string) (godwarf.Type, error) {
 	return bi.findType(name)
@@ -2504,7 +2680,7 @@ func (bi *BinaryInfo) findTypeExpr(expr ast.Expr) (godwarf.Type, error) {
 		}
 		return bi.findType(typn)
 	}
-	bi.expandPackagesInType(expr)
+	expr = bi.expandPackagesInType(expr)
 	if snode, ok := expr.(*ast.StarExpr); ok {
 		// Pointer types only appear in the dwarf information when
 		// a pointer to the type is used in the target program, here
@@ -2696,6 +2872,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	slices.SortFunc(image.compileUnits, func(a, b *compileUnit) int { return cmp.Compare(a.offset, b.offset) })
 	slices.SortFunc(bi.Functions, func(a, b Function) int { return cmp.Compare(a.Entry, b.Entry) })
 	slices.SortFunc(bi.packageVars, func(a, b packageVar) int { return cmp.Compare(a.addr, b.addr) })
+	bi.addPcLnTrampolineFunctions(image)
 
 	bi.lookupFunc = nil
 	bi.lookupGenericFunc = nil
@@ -2941,7 +3118,7 @@ func (bi *BinaryInfo) addConcreteSubprogram(entry *dwarf.Entry, ctxt *loadDebugI
 		bi.logger.Warnf("reading debug_info: concrete subprogram without name at %#x", entry.Offset)
 	}
 
-	trampoline, _ := entry.Val(dwarf.AttrTrampoline).(bool)
+	trampoline, trampolineTarget := trampolineTarget(entry, cu.image.StaticBase)
 
 	originIdx := ctxt.lookupAbstractOrigin(bi, entry.Offset)
 	fn := &bi.Functions[originIdx]
@@ -2952,6 +3129,7 @@ func (bi *BinaryInfo) addConcreteSubprogram(entry *dwarf.Entry, ctxt *loadDebugI
 	fn.offset = entry.Offset
 	fn.cu = cu
 	fn.Trampoline = trampoline
+	fn.TrampolineTarget = trampolineTarget
 
 	if entry.Children {
 		bi.loadDebugInfoMapsInlinedCalls(ctxt, reader, cu)
@@ -2977,6 +3155,20 @@ func subprogramEntryRange(entry *dwarf.Entry, image *Image) (lowpc, highpc uint6
 		highpc = ranges[0][1] + image.StaticBase
 	}
 	return lowpc, highpc, ok
+}
+
+// trampolineTarget returns whether entry identifies a trampoline and, for
+// linker-generated direct trampolines, the static destination recorded in
+// DW_AT_trampoline. Older compilers use the attribute as a boolean flag.
+func trampolineTarget(entry *dwarf.Entry, staticBase uint64) (trampoline bool, target uint64) {
+	switch value := entry.Val(dwarf.AttrTrampoline).(type) {
+	case bool:
+		return value, 0
+	case uint64:
+		return true, value + staticBase
+	default:
+		return false, 0
+	}
 }
 
 func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsContext, reader *reader.Reader, cu *compileUnit) {
@@ -3042,44 +3234,71 @@ func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsConte
 	}
 }
 
-func (bi *BinaryInfo) expandPackagesInType(expr ast.Expr) {
+func (bi *BinaryInfo) expandPackagesInType(expr ast.Expr) ast.Expr {
 	switch e := expr.(type) {
 	case *ast.ArrayType:
-		bi.expandPackagesInType(e.Elt)
+		r := *e
+		r.Elt = bi.expandPackagesInType(e.Elt)
+		return &r
 	case *ast.ChanType:
-		bi.expandPackagesInType(e.Value)
+		r := *e
+		r.Value = bi.expandPackagesInType(e.Value)
+		return &r
 	case *ast.FuncType:
+		r := *e
+		params := *(r.Params)
+		params.List = make([]*ast.Field, len(params.List))
+		r.Params = &params
 		for i := range e.Params.List {
-			bi.expandPackagesInType(e.Params.List[i].Type)
+			field := *(e.Params.List[i])
+			params.List[i] = &field
+			field.Type = bi.expandPackagesInType(e.Params.List[i].Type)
 		}
 		if e.Results != nil {
+			results := *(r.Results)
+			results.List = make([]*ast.Field, len(results.List))
+			r.Results = &results
 			for i := range e.Results.List {
-				bi.expandPackagesInType(e.Results.List[i].Type)
+				field := *(e.Results.List[i])
+				results.List[i] = &field
+				field.Type = bi.expandPackagesInType(e.Results.List[i].Type)
 			}
 		}
+		return &r
 	case *ast.MapType:
-		bi.expandPackagesInType(e.Key)
-		bi.expandPackagesInType(e.Value)
+		r := *e
+		r.Key = bi.expandPackagesInType(e.Key)
+		r.Value = bi.expandPackagesInType(e.Value)
+		return &r
 	case *ast.ParenExpr:
-		bi.expandPackagesInType(e.X)
+		r := *e
+		r.X = bi.expandPackagesInType(e.X)
+		return &r
 	case *ast.SelectorExpr:
+		r := *e
 		switch x := e.X.(type) {
 		case *ast.Ident:
 			if len(bi.PackageMap[x.Name]) > 0 {
+				ident := *x
 				// There's no particular reason to expect the first entry to be the
 				// correct one if the package name is ambiguous, but trying all possible
 				// expansions of all types mentioned in the expression is complicated
 				// and, besides type assertions, users can always specify the type they
 				// want exactly, using a string.
-				x.Name = bi.PackageMap[x.Name][0]
+				ident.Name = bi.PackageMap[x.Name][0]
+				r.X = &ident
 			}
 		default:
-			bi.expandPackagesInType(e.X)
+			r.X = bi.expandPackagesInType(e.X)
 		}
+		return &r
 	case *ast.StarExpr:
-		bi.expandPackagesInType(e.X)
+		r := *e
+		r.X = bi.expandPackagesInType(e.X)
+		return &r
 	default:
 		// nothing to do
+		return expr
 	}
 }
 

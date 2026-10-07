@@ -41,6 +41,10 @@ type Fixture struct {
 type fixtureKey struct {
 	Name  string
 	Flags BuildFlags
+	// GoExperiment is the value of GOEXPERIMENT during compilation.
+	//
+	// Track this as it some tests use different GOEXPERIMENT values.
+	GoExperiment string
 }
 
 // Fixtures is a map of fixtureKey{ Fixture.Name, buildFlags } to Fixture.
@@ -92,6 +96,9 @@ const (
 	// LinkDisableDWARF enables '-ldflags="-w"'.
 	LinkDisableDWARF
 	Trimpath
+	// LinkDebugTrampolines asks the linker to generate trampolines for
+	// cross-package calls.
+	LinkDebugTrampolines
 )
 
 // TempFile makes a (good enough) random temporary file name
@@ -107,7 +114,7 @@ func BuildFixture(t testing.TB, name string, flags BuildFlags) Fixture {
 	if !runningWithFixtures {
 		panic("RunTestsWithFixtures not called")
 	}
-	fk := fixtureKey{name, flags}
+	fk := fixtureKey{Name: name, Flags: flags, GoExperiment: os.Getenv("GOEXPERIMENT")}
 	fixturesmu.Lock()
 	if f, ok := fixtures[fk]; ok {
 		fixturesmu.Unlock()
@@ -148,6 +155,9 @@ func BuildFixture(t testing.TB, name string, flags BuildFlags) Fixture {
 	}
 	if flags&LinkDisableDWARF != 0 {
 		ldflagsv = append(ldflagsv, "-w")
+	}
+	if flags&LinkDebugTrampolines != 0 {
+		ldflagsv = append(ldflagsv, "-debugtramp=2")
 	}
 	buildFlags = append(buildFlags, "-ldflags="+strings.Join(ldflagsv, " "))
 	gcflagsv := []string{}
@@ -198,9 +208,7 @@ func BuildFixture(t testing.TB, name string, flags BuildFlags) Fixture {
 
 	// Build the test binary
 	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Printf("Error compiling %s: %s\n", path, err)
-		fmt.Printf("%s\n", string(out))
-		os.Exit(1)
+		t.Fatalf("Error compiling %s: %s\n%s", path, err, string(out))
 	}
 
 	source, _ := filepath.Abs(path)
@@ -333,10 +341,7 @@ func MustSupportFunctionCalls(t *testing.T, testBackend string) {
 		t.Skip("this backend does not support function calls")
 	}
 
-	if runtime.GOARCH == "386" {
-		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
-	}
-	if runtime.GOARCH == "riscv64" {
+	if runtime.GOARCH == "386" || runtime.GOARCH == "riscv64" {
 		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
 	}
 	if runtime.GOARCH == "loong64" {
@@ -454,6 +459,9 @@ func GetDlvBinary(t *testing.T) string {
 	t.Helper()
 
 	var tags []string
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		tags = []string{"-tags=exp.winarm64"}
+	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
 		tags = []string{"-tags=exp.linuxppc64le"}
 	}

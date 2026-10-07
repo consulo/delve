@@ -10,7 +10,7 @@ import (
 )
 
 type mapIterator interface {
-	next() bool
+	next(timedOut func() bool) bool
 	key() *Variable
 	value() *Variable
 }
@@ -96,6 +96,8 @@ func (v *Variable) mapIterator(maxNumBuckets uint64) mapIterator {
 	return it
 }
 
+const checkTimedOutInterval = 1000
+
 // Classic Maps ///////////////////////////////////////////////////////////////
 
 type mapIteratorClassic struct {
@@ -120,6 +122,8 @@ type mapIteratorClassic struct {
 
 	hashTophashEmptyOne uint64 // Go 1.12 and later has two sentinel tophash values for an empty cell, this is the second one (the first one hashTophashEmptyZero, the same as Go 1.11 and earlier)
 	hashMinTopHash      uint64 // minimum value of tophash for a cell that isn't either evacuated or empty
+
+	cnt int
 }
 
 var (
@@ -128,7 +132,7 @@ var (
 	errMapBucketsNotStruct              = errors.New("malformed map type: buckets, oldbuckets or overflow field not a struct")
 )
 
-func (it *mapIteratorClassic) nextBucket() bool {
+func (it *mapIteratorClassic) nextBucket(timedOut func() bool) bool {
 	if it.overflow != nil && it.overflow.Addr > 0 {
 		it.b = it.overflow
 	} else {
@@ -139,6 +143,11 @@ func (it *mapIteratorClassic) nextBucket() bool {
 		}
 
 		for it.bidx < it.numbuckets {
+			it.cnt++
+			if timedOut != nil && it.cnt%checkTimedOutInterval == 0 && timedOut() {
+				return false
+			}
+
 			it.b = it.buckets.clone()
 			it.b.Addr += uint64(it.buckets.DwarfType.Size()) * it.bidx
 
@@ -244,10 +253,14 @@ func (it *mapIteratorClassic) nextBucket() bool {
 	return true
 }
 
-func (it *mapIteratorClassic) next() bool {
+func (it *mapIteratorClassic) next(timedOut func() bool) bool {
 	for {
+		it.cnt++
+		if timedOut != nil && it.cnt%checkTimedOutInterval == 0 && timedOut() {
+			return false
+		}
 		if it.b == nil || it.idx >= it.tophashes.Len {
-			r := it.nextBucket()
+			r := it.nextBucket(timedOut)
 			if !r {
 				return false
 			}
@@ -322,7 +335,32 @@ type mapIteratorSwiss struct {
 	keyTypeIsPtr, elemTypeIsPtr bool
 	tableType, groupType        *godwarf.StructType
 
-	tableFieldIndex, tableFieldGroups, groupsFieldLengthMask, groupsFieldData, groupFieldCtrl, groupFieldSlots, slotFieldKey, slotFieldElem *godwarf.StructField
+	tableFieldIndex, tableFieldGroups, groupsFieldLengthMask, groupsFieldData, groupFieldCtrl *godwarf.StructField
+
+	// GOEXPERIMENT=nomapsplitgroup
+	//
+	// Interleaved slot layout (KVKVKVKV):
+	//
+	// type group struct {
+	//     ctrl  uint64
+	//     slots [abi.MapGroupSlots]struct {
+	//         key  keyType
+	//         elem elemType
+	//     }
+	// }
+	groupFieldSlots, slotFieldKey, slotFieldElem *godwarf.StructField
+
+	// GOEXPERIMENT=mapsplitgroup
+	//
+	// Split layout (KKKKVVVV):
+	//
+	// type group struct {
+	//     ctrl  uint64
+	//     keys  [abi.MapGroupSlots]keyType
+	//     elems [abi.MapGroupSlots]elemType
+	// }
+	mapsplitgroup                   bool
+	groupFieldKeys, groupFieldElems *godwarf.StructField
 
 	dirIdx int64
 	tab    *swissTable
@@ -335,6 +373,8 @@ type mapIteratorSwiss struct {
 	groupCount uint64 // Total count of visited groups except for current table
 
 	curKey, curValue *Variable
+
+	cnt int
 }
 
 type swissTable struct {
@@ -343,8 +383,13 @@ type swissTable struct {
 }
 
 type swissGroup struct {
-	slots *Variable
 	ctrls []byte
+
+	// GOEXPERIMENT=nomapsplitgroup
+	slots *Variable
+
+	// GOEXPERIMENT=mapsplitgroup
+	keys, elems *Variable
 }
 
 var (
@@ -405,36 +450,54 @@ func (it *mapIteratorSwiss) loadTypes() {
 		switch field.Name {
 		case "ctrl":
 			it.groupFieldCtrl = field
+		// GOEXPERIMENT=nomapsplitgroup
 		case "slots":
 			it.groupFieldSlots = field
+		// GOEXPERIMENT=mapsplitgroup
+		case "keys":
+			it.groupFieldKeys = field
+		case "elems":
+			it.groupFieldElems = field
 		}
 	}
-	if it.groupFieldCtrl == nil || it.groupFieldSlots == nil {
+	if it.groupFieldCtrl == nil {
+		it.v.Unreadable = errSwissMapBadGroupTypeErr
+		return
+	}
+	// Either slots or keys+elems must exist.
+	it.mapsplitgroup = it.groupFieldKeys != nil && it.groupFieldElems != nil
+	if !it.mapsplitgroup && it.groupFieldSlots == nil {
+		it.v.Unreadable = errSwissMapBadGroupTypeErr
+		return
+	}
+	if it.mapsplitgroup && it.groupFieldSlots != nil {
 		it.v.Unreadable = errSwissMapBadGroupTypeErr
 		return
 	}
 
-	slotsType, ok := godwarf.ResolveTypedef(it.groupFieldSlots.Type).(*godwarf.ArrayType)
-	if !ok {
-		it.v.Unreadable = errSwissMapBadGroupTypeErr
-		return
-	}
-	slotType, ok := slotsType.Type.(*godwarf.StructType)
-	if !ok {
-		it.v.Unreadable = errSwissMapBadGroupTypeErr
-		return
-	}
-	for _, field := range slotType.Field {
-		switch field.Name {
-		case "key":
-			it.slotFieldKey = field
-		case "elem":
-			it.slotFieldElem = field
+	if !it.mapsplitgroup {
+		slotsType, ok := godwarf.ResolveTypedef(it.groupFieldSlots.Type).(*godwarf.ArrayType)
+		if !ok {
+			it.v.Unreadable = errSwissMapBadGroupTypeErr
+			return
 		}
-	}
-	if it.slotFieldKey == nil || it.slotFieldElem == nil {
-		it.v.Unreadable = errSwissMapBadGroupTypeErr
-		return
+		slotType, ok := slotsType.Type.(*godwarf.StructType)
+		if !ok {
+			it.v.Unreadable = errSwissMapBadGroupTypeErr
+			return
+		}
+		for _, field := range slotType.Field {
+			switch field.Name {
+			case "key":
+				it.slotFieldKey = field
+			case "elem":
+				it.slotFieldElem = field
+			}
+		}
+		if it.slotFieldKey == nil || it.slotFieldElem == nil {
+			it.v.Unreadable = errSwissMapBadGroupTypeErr
+			return
+		}
 	}
 
 	if it.dirLen <= 0 {
@@ -455,17 +518,26 @@ func (it *mapIteratorSwiss) loadTypes() {
 }
 
 // derived from $GOROOT/src/internal/runtime/maps/table.go and $GOROOT/src/runtime/runtime-gdb.py
-func (it *mapIteratorSwiss) next() bool {
+func (it *mapIteratorSwiss) next(timedOut func() bool) bool {
 	if it.v.Unreadable != nil {
 		return false
 	}
 	for it.dirIdx < it.dirLen {
+		if it.maxNumGroups > 0 && it.groupIdx+it.groupCount >= it.maxNumGroups {
+			it.v.Unreadable = fmt.Errorf("max number of groups exceeded: %d", it.groupCount)
+			return false
+		}
+		it.cnt++
+		if timedOut != nil && it.cnt%checkTimedOutInterval == 0 && timedOut() {
+			return false
+		}
 		if it.tab == nil {
 			it.loadCurrentTable()
 			if it.tab == nil {
 				return false
 			}
 			if it.tab.index != it.dirIdx {
+				it.groupCount++ // count this as visiting a group so that maxNumGroups is held even if memory is corrupted and there are no real tables.
 				it.nextTable()
 				continue
 			}
@@ -473,6 +545,7 @@ func (it *mapIteratorSwiss) next() bool {
 
 		for ; it.groupIdx < uint64(it.tab.groups.Len); it.nextGroup() {
 			if it.maxNumGroups > 0 && it.groupIdx+it.groupCount >= it.maxNumGroups {
+				it.v.Unreadable = fmt.Errorf("max number of groups exceeded: %d", it.groupCount)
 				return false
 			}
 			if it.group == nil {
@@ -482,20 +555,35 @@ func (it *mapIteratorSwiss) next() bool {
 				}
 			}
 
-			for ; it.slotIdx < uint32(it.group.slots.Len); it.slotIdx++ {
+			var slotsLen uint32
+			if it.mapsplitgroup {
+				slotsLen = uint32(it.group.keys.Len)
+			} else {
+				slotsLen = uint32(it.group.slots.Len)
+			}
+			for ; it.slotIdx < slotsLen; it.slotIdx++ {
+				it.cnt++
+				if timedOut != nil && it.cnt%checkTimedOutInterval == 0 && timedOut() {
+					return false
+				}
 				if it.slotIsEmptyOrDeleted(it.slotIdx) {
 					continue
 				}
 
-				cur, err := it.group.slots.sliceAccess(int(it.slotIdx))
-				if err != nil {
-					it.v.Unreadable = fmt.Errorf("error accessing swiss map in table %d, group %d, slot %d", it.dirIdx, it.groupIdx, it.slotIdx)
-					return false
-				}
-
 				var err1, err2 error
-				it.curKey, err1 = cur.toField(it.slotFieldKey)
-				it.curValue, err2 = cur.toField(it.slotFieldElem)
+				if it.mapsplitgroup {
+					it.curKey, err1 = it.group.keys.sliceAccess(int(it.slotIdx))
+					it.curValue, err2 = it.group.elems.sliceAccess(int(it.slotIdx))
+				} else {
+					cur, err := it.group.slots.sliceAccess(int(it.slotIdx))
+					if err != nil {
+						it.v.Unreadable = fmt.Errorf("error accessing swiss map in table %d, group %d, slot %d", it.dirIdx, it.groupIdx, it.slotIdx)
+						return false
+					}
+
+					it.curKey, err1 = cur.toField(it.slotFieldKey)
+					it.curValue, err2 = cur.toField(it.slotFieldElem)
+				}
 				if err1 != nil || err2 != nil {
 					it.v.Unreadable = fmt.Errorf("error accessing swiss map slot: %v %v", err1, err2)
 					return false
@@ -583,9 +671,15 @@ func (it *mapIteratorSwiss) loadCurrentTable() {
 	}
 
 	// convert the type of groups from *group to *[len]group so that it's easier to use
-	r.groups.DwarfType = pointerTo(fakeArrayType(groupsLengthMask+1, it.groupType), it.v.bi.Arch)
+	fat := fakeArrayType(groupsLengthMask+1, it.groupType)
+	r.groups.DwarfType = pointerTo(fat, it.v.bi.Arch)
 	r.groups.RealType = r.groups.DwarfType
 	r.groups = r.groups.maybeDereference()
+	if r.groups.stride != fat.(*godwarf.ArrayType).StrideBitSize/8 {
+		// This discrpancy indicates an overflow in the multiplication of the
+		// element type size and the number of elements in fakeArrayType.
+		it.v.Unreadable = fmt.Errorf("impossible table lenght in swiss table: %d", groupsLengthMask)
+	}
 
 	if r.groups.Addr == 0 {
 		it.v.Unreadable = errSwissTableNilGroups
@@ -602,13 +696,10 @@ func (it *mapIteratorSwiss) loadCurrentGroup() {
 		it.v.Unreadable = fmt.Errorf("could not load swiss map group: %v", err)
 		return
 	}
+
 	g := &swissGroup{}
+
 	var err2 error
-	g.slots, err2 = group.toField(it.groupFieldSlots)
-	if err2 != nil {
-		it.v.Unreadable = fmt.Errorf("could not load swiss map group slots: %v", err2)
-		return
-	}
 	ctrl, err2 := group.toField(it.groupFieldCtrl)
 	if err2 != nil {
 		it.v.Unreadable = fmt.Errorf("could not load swiss map group ctrl: %v", err2)
@@ -620,6 +711,26 @@ func (it *mapIteratorSwiss) loadCurrentGroup() {
 		it.v.Unreadable = err
 		return
 	}
+
+	if it.mapsplitgroup {
+		g.keys, err2 = group.toField(it.groupFieldKeys)
+		if err2 != nil {
+			it.v.Unreadable = fmt.Errorf("could not load swiss map group keys: %v", err2)
+			return
+		}
+		g.elems, err2 = group.toField(it.groupFieldElems)
+		if err2 != nil {
+			it.v.Unreadable = fmt.Errorf("could not load swiss map group elems: %v", err2)
+			return
+		}
+	} else {
+		g.slots, err2 = group.toField(it.groupFieldSlots)
+		if err2 != nil {
+			it.v.Unreadable = fmt.Errorf("could not load swiss map group slots: %v", err2)
+			return
+		}
+	}
+
 	it.group = g
 }
 

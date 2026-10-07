@@ -172,6 +172,11 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 		log:         logger,
 	}
 
+	// Validate AttachPid if specified
+	if d.config.AttachPid != 0 && d.config.AttachPid < 0 {
+		return nil, fmt.Errorf("invalid process ID: %d", d.config.AttachPid)
+	}
+
 	// Create the process by either attaching or launching.
 	switch {
 	case d.config.AttachPid > 0 || d.config.AttachWaitFor != "":
@@ -817,6 +822,17 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 	return createdBp, nil
 }
 
+// SetExecutionPoint sets the next instruction to be executed by the current
+// thread to addr, without executing any of the instructions in between (also
+// known as "set next statement" or "jump"). The target address must be inside
+// the function the current thread is stopped in.
+func (d *Debugger) SetExecutionPoint(addr uint64) error {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+
+	return d.target.Selected.SetNextExecutionPoint(addr)
+}
+
 func (d *Debugger) convertBreakpoint(lbp *proc.LogicalBreakpoint) *api.Breakpoint {
 	abp := api.ConvertLogicalBreakpoint(lbp)
 	bps := []*proc.Breakpoint{}
@@ -1096,6 +1112,11 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 			}
 		}
 		d.recordMutex.Unlock()
+
+		if resumeNotify != nil {
+			close(resumeNotify)
+			resumeNotify = nil
+		}
 	}
 
 	withBreakpointInfo := true
@@ -1324,7 +1345,7 @@ func (d *Debugger) collectBreakpointInformation(apiThread *api.Thread, thread pr
 		bpi.Variables = make([]api.Variable, len(bp.Variables))
 	}
 	for i := range bp.Variables {
-		v, err := s.EvalExpression(bp.Variables[i], proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1})
+		v, err := s.EvalExpression(bp.Variables[i], proc.LoadFullValue())
 		if err != nil {
 			bpi.Variables[i] = api.Variable{Name: bp.Variables[i], Unreadable: fmt.Sprintf("eval error: %v", err)}
 		} else {
@@ -1752,7 +1773,7 @@ func (d *Debugger) LoadResliced(v *proc.Variable, start int, cfg proc.LoadConfig
 
 // SetVariableInScope will set the value of the variable represented by
 // 'symbol' to the value given, in the given scope.
-func (d *Debugger) SetVariableInScope(goid int64, frame, deferredCall int, symbol, value string) error {
+func (d *Debugger) SetVariableInScope(goid int64, frame, deferredCall int, symbol, value string, timeout int) error {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
@@ -1760,7 +1781,7 @@ func (d *Debugger) SetVariableInScope(goid int64, frame, deferredCall int, symbo
 	if err != nil {
 		return err
 	}
-	return s.SetVariable(symbol, value)
+	return s.SetVariable(symbol, value, timeout)
 }
 
 // Goroutines will return a list of goroutines in the target process.
@@ -2401,8 +2422,16 @@ func (d *Debugger) AttachPid() int {
 	return d.config.AttachPid
 }
 
-func (d *Debugger) GetBufferedTracepoints() []api.TracepointResult {
-	traces := d.target.Selected.GetBufferedTracepoints()
+func (d *Debugger) GetBufferedTracepoints(loadCfg *api.LoadConfig) []api.TracepointResult {
+	// Default matches ShortLoadConfig / ptrace verbosity-0 behaviour: pointers are
+	// not followed, arrays/slices show no elements, and structs are capped at 3
+	// fields.  This keeps the eBPF backend consistent with the ptrace terminal
+	// backend at the default verbosity level.
+	cfg := proc.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
+	if loadCfg != nil {
+		cfg = *api.LoadConfigToProc(loadCfg)
+	}
+	traces := d.target.Selected.GetBufferedTracepoints(cfg)
 	if traces == nil {
 		return nil
 	}
@@ -2635,10 +2664,32 @@ func (d *Debugger) CancelDownloads() bool {
 }
 
 // DownloadLibraryDebugInfo attempts to download the specified library's debug info.
-func (d *Debugger) DownloadLibraryDebugInfo(n int) error {
+func (d *Debugger) DownloadLibraryDebugInfo(n int, eventsFn func(*proc.Event)) error {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
-	return d.target.Selected.BinInfo().LoadImageBinaryInfoAgain(n)
+	if eventsFn != nil {
+		defer eventsFn(&proc.Event{Kind: proc.EventDownloadLibraryInfoDone})
+	}
+	d.target.SetEventsFn(eventsFn)
+	bi := d.target.Selected.BinInfo()
+	bi.ResetDownloadsContext()
+	if n > 0 {
+		return bi.LoadImageBinaryInfoAgain(n)
+	}
+	tried, succeeded := 0, 0
+	for i := range bi.Images {
+		if bi.Images[i].LoadError() != nil {
+			tried++
+			err := bi.LoadImageBinaryInfoAgain(i)
+			if err == nil {
+				succeeded++
+			}
+		}
+	}
+	if tried != succeeded {
+		return fmt.Errorf("downloaded %d/%d libraries", succeeded, tried)
+	}
+	return nil
 }
 
 func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function, fileForFunc func(int, *proc.Function) string) map[string]string {

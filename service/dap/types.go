@@ -185,6 +185,14 @@ type LaunchAttachCommonConfig struct {
 	// Default is 50.
 	StackTraceDepth int `json:"stackTraceDepth,omitempty"`
 
+	// Maximum number of bytes loaded for strings.
+	// Default is 512.
+	MaxStringLen int `json:"maxStringLen,omitempty"`
+
+	// Maximum number of array, slice and map elements loaded.
+	// Default is 64.
+	MaxArrayValues int `json:"maxArrayValues,omitempty"`
+
 	// Boolean value to indicate whether global package variables
 	// should be shown in the variables pane or not.
 	ShowGlobalVariables bool `json:"showGlobalVariables,omitempty"`
@@ -214,6 +222,13 @@ type LaunchAttachCommonConfig struct {
 	// The debug adapter will replace the local path with the remote path in all of the calls.
 	// See also Documentation/cli/substitutepath.md.
 	SubstitutePath []SubstitutePath `json:"substitutePath,omitempty"`
+
+	// ShowRawStrings indicates whether escape characters (newlines, tabs, etc.)
+	// in string values should be preserved as actual control characters rather
+	// than being displayed as escaped sequences like \n, \t. When enabled,
+	// multi-line strings will appear as multi-line in the debugger UI.
+	// Default is false.
+	ShowRawStrings bool `json:"showRawStrings,omitempty"`
 }
 
 // SubstitutePath defines a mapping from a local path to the remote path.

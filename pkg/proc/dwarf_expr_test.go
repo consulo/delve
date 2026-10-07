@@ -41,7 +41,7 @@ func fakeBinaryInfo(t *testing.T, dwb *dwarfbuilder.Builder) (*proc.BinaryInfo, 
 	dwdata, err := dwarf.New(abbrev, aranges, frame, info, line, pubnames, ranges, str)
 	assertNoError(err, t, "creating dwarf")
 
-	bi := proc.NewBinaryInfo("linux", "amd64")
+	bi := proc.NewBinaryInfo("linux", "amd64", false)
 	bi.LoadImageFromData(dwdata, frame, line, loc)
 
 	return bi, dwdata
@@ -253,9 +253,9 @@ func TestDwarfExprComposite(t *testing.T) {
 
 	// Test writes to composite memory
 
-	assertNoError(scope.SetVariable("n", "47"), t, "SetVariable(n, 47)")
-	assertNoError(scope.SetVariable("pair.k", "12"), t, "SetVariable(pair.k, 12)")
-	assertNoError(scope.SetVariable("pair.v", "13"), t, "SetVariable(pair.v, 13)")
+	assertNoError(scope.SetVariable("n", "47", 0), t, "SetVariable(n, 47)")
+	assertNoError(scope.SetVariable("pair.k", "12", 0), t, "SetVariable(pair.k, 12)")
+	assertNoError(scope.SetVariable("pair.v", "13", 0), t, "SetVariable(pair.v, 13)")
 
 	for i := range changeCalls {
 		t.Logf("%q\n", changeCalls[i])

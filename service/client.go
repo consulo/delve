@@ -72,6 +72,9 @@ type Client interface {
 	GetBreakpointByName(name string) (*api.Breakpoint, error)
 	// CreateBreakpoint creates a new breakpoint.
 	CreateBreakpoint(*api.Breakpoint) (*api.Breakpoint, error)
+	// SetExecutionPoint sets the next instruction to be executed by the current
+	// thread to the instruction at the given address ("set next statement").
+	SetExecutionPoint(addr uint64) (*api.DebuggerState, error)
 	// CreateBreakpointWithExpr creates a new breakpoint and sets an expression to restore it after it is disabled.
 	CreateBreakpointWithExpr(*api.Breakpoint, string, [][2]string, bool) (*api.Breakpoint, error)
 	// CreateWatchpoint creates a new watchpoint.
@@ -105,7 +108,7 @@ type Client interface {
 	TypeInfo(name string) (*api.TypeInfo, error)
 
 	// SetVariable sets the value of a variable
-	SetVariable(scope api.EvalScope, symbol, value string) error
+	SetVariable(scope api.EvalScope, symbol, value string, timeout int) error
 
 	// ListSources lists all source files in the process matching filter.
 	ListSources(filter string) ([]string, error)

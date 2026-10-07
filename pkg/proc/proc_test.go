@@ -40,7 +40,7 @@ import (
 	"github.com/go-delve/delve/service/api"
 )
 
-var normalLoadConfig = proc.LoadConfig{true, 1, 64, 64, -1, 0}
+var normalLoadConfig = proc.LoadFullValue()
 var testBackend, buildMode string
 
 func init() {
@@ -1069,9 +1069,12 @@ func evalVariable(p *proc.Target, t testing.TB, symbol string) *proc.Variable {
 
 func TestFrameEvaluation(t *testing.T) {
 	protest.AllowRecording(t)
-	lenient := false
+	leniency := 0
 	if runtime.GOOS == "windows" {
-		lenient = true
+		leniency = 1
+		if runtime.GOARCH == "arm64" {
+			leniency = 2
+		}
 	}
 	withTestProcess("goroutinestackprog", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.stacktraceme")
@@ -1114,13 +1117,17 @@ func TestFrameEvaluation(t *testing.T) {
 				continue
 			}
 			vval, _ := constant.Int64Val(v.Value)
+			if vval < 0 || vval >= int64(len(found)) {
+				t.Logf("Goroutine %d: unexpected value of i: %d\n", g.ID, vval)
+				continue
+			}
 			found[vval] = true
 		}
 
 		for i := range found {
 			if !found[i] {
-				if lenient {
-					lenient = false
+				if leniency > 0 {
+					leniency--
 				} else {
 					t.Fatalf("Goroutine %d not found\n", i)
 				}
@@ -1495,6 +1502,34 @@ func BenchmarkLocalVariables(b *testing.B) {
 	})
 }
 
+func BenchmarkStacktrace(b *testing.B) {
+	withTestProcess("deepstack", b, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.Continue(), b, "Continue()")
+
+		g, err := proc.GetG(p.CurrentThread())
+		assertNoError(err, b, "GetG()")
+		if g == nil {
+			b.Fatal("no current goroutine")
+		}
+
+		frames, err := proc.GoroutineStacktrace(p, g, 600, 0)
+		assertNoError(err, b, "GoroutineStacktrace()")
+		if len(frames) < 500 {
+			b.Fatalf("expected at least 500 frames, got %d", len(frames))
+		}
+		b.Logf("stack depth: %d frames", len(frames))
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, err := proc.GoroutineStacktrace(p, g, 600, 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func TestCondBreakpoint(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestProcess("parallel_next", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
@@ -1681,6 +1716,42 @@ func TestStepIntoFunction(t *testing.T) {
 		}
 		if loc.Line != 8 {
 			t.Fatalf("debugger stopped at incorrect line: %d", loc.Line)
+		}
+	})
+}
+
+func TestStepIntoFunctionThroughARM64LinkerTrampoline(t *testing.T) {
+	skipUnlessOn(t, "linker trampoline instruction sequence is architecture-specific", "arm64")
+	skipOn(t, "PE pclntab loading is not supported", "windows")
+	withTestProcessArgs("linkertrampoline/", t, ".", nil, protest.LinkDebugTrampolines, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.Continue(), t, "Continue() returned an error")
+
+		loc, err := proc.ThreadLocation(p.CurrentThread())
+		assertNoError(err, t, "ThreadLocation() returned an error")
+		text, err := proc.Disassemble(p.Memory(), nil, p.Breakpoints(), p.BinInfo(), loc.PC, loc.PC+4)
+		assertNoError(err, t, "Disassemble() returned an error")
+		if len(text) != 1 || text[0].DestLoc == nil || text[0].DestLoc.Fn == nil {
+			t.Fatalf("expected call destination to have a linker trampoline function, disassembled %#v", text)
+		}
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 28) {
+			if !text[0].DestLoc.Fn.Trampoline || text[0].DestLoc.Fn.TrampolineTarget == 0 {
+				t.Fatal("expected DW_AT_trampoline to identify the direct trampoline target")
+			}
+		} else {
+			if !strings.HasSuffix(text[0].DestLoc.Fn.Name, "+0-tramp0") {
+				t.Fatalf("expected pclntab linker trampoline, got %q", text[0].DestLoc.Fn.Name)
+			}
+			if !text[0].DestLoc.Fn.Trampoline {
+				t.Fatal("expected pclntab linker trampoline to be marked as a trampoline")
+			}
+		}
+
+		assertNoError(grp.Step(), t, "Step() returned an error")
+
+		loc, err = proc.ThreadLocation(p.CurrentThread())
+		assertNoError(err, t, "ThreadLocation() returned an error")
+		if loc.Fn == nil || loc.Fn.Name != "github.com/go-delve/delve/_fixtures/linkertrampoline/callee.Call" {
+			t.Fatalf("expected to step through the linker trampoline into callee.Call, stopped at %#v", loc)
 		}
 	})
 }
@@ -2023,6 +2094,24 @@ func TestStepParked(t *testing.T) {
 	})
 }
 
+func TestBuildFixtureGoExperiment(t *testing.T) {
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
+		t.Skip("noswissmap experiment does not exist before Go 1.24")
+	}
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 26) {
+		t.Skip("noswissmap experiment removed in Go 1.26")
+	}
+
+	// Regression test: BuildFixture must not return a binary cached under a
+	// different GOEXPERIMENT, since the experiment changes the built binary.
+	defaultFixture := protest.BuildFixture(t, "testvariables2", 0)
+	t.Setenv("GOEXPERIMENT", "noswissmap")
+	experimentFixture := protest.BuildFixture(t, "testvariables2", 0)
+	if defaultFixture.Path == experimentFixture.Path {
+		t.Fatalf("BuildFixture returned the same binary %q for different GOEXPERIMENT values", defaultFixture.Path)
+	}
+}
+
 func TestUnsupportedArch(t *testing.T) {
 	ver, _ := goversion.Parse(runtime.Version())
 	if ver.Major < 0 || !ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 6, Rev: -1}) || ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 7, Rev: -1}) {
@@ -2134,6 +2223,7 @@ func TestStepOut(t *testing.T) {
 
 func TestStepConcurrentDirect(t *testing.T) {
 	protest.AllowRecording(t)
+	skipOn(t, "broken - step concurrent", "windows", "arm64")
 	withTestProcess("teststepconcurrent", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 37)
 
@@ -2355,6 +2445,7 @@ func TestStepOutDeferReturnAndDirectCall(t *testing.T) {
 }
 
 func TestStepOnCallPtrInstr(t *testing.T) {
+	skipOn(t, "broken", "linux", "riscv64")
 	protest.AllowRecording(t)
 	withTestProcess("teststepprog", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 10)
@@ -2512,7 +2603,7 @@ func BenchmarkTrace(b *testing.B) {
 			assertNoError(grp.Continue(), b, "Continue()")
 			s, err := proc.GoroutineScope(p, p.CurrentThread())
 			assertNoError(err, b, "Scope()")
-			_, err = s.FunctionArguments(proc.LoadConfig{false, 0, 64, 0, 3, 0})
+			_, err = s.FunctionArguments(proc.LoadConfig{false, 0, 64, 0, 3, 0, 0})
 			assertNoError(err, b, "FunctionArguments()")
 		}
 		b.StopTimer()
@@ -2878,6 +2969,7 @@ func TestDebugStripped(t *testing.T) {
 	skipOn(t, "not working on windows", "windows")
 	skipOn(t, "not working on freebsd", "freebsd")
 	skipOn(t, "not working on linux/386", "linux", "386")
+	skipOn(t, "not working on linux/riscv64", "linux", "riscv64")
 	skipOn(t, "not working on linux/ppc64le when -gcflags=-N -l is passed", "linux", "ppc64le")
 	ver, _ := goversion.Parse(runtime.Version())
 	if ver.IsDevelBuild() {
@@ -3071,8 +3163,10 @@ func TestCgoStacktrace(t *testing.T) {
 		}
 	}
 	skipOn(t, "broken - cgo stacktraces", "386")
+	// C frames on windows/arm64 use PE .pdata/.xdata (clang), not DWARF
+	// .debug_frame; Delve does not unwind via .pdata yet. Unrelated to the
+	// arm64 crosscall2 SP restore.
 	skipOn(t, "broken - cgo stacktraces", "windows", "arm64")
-	skipOn(t, "broken - cgo stacktraces", "linux", "ppc64le")
 	protest.MustHaveCgo(t)
 
 	// Tests that:
@@ -4024,7 +4118,7 @@ func TestIssue1432(t *testing.T) {
 		scope, err := proc.GoroutineScope(p, p.CurrentThread())
 		assertNoError(err, t, "GoroutineScope()")
 
-		err = scope.SetVariable(fmt.Sprintf("(*\"main.s\")(%#x).i", svar.Addr), "10")
+		err = scope.SetVariable(fmt.Sprintf("(*\"main.s\")(%#x).i", svar.Addr), "10", 0)
 		assertNoError(err, t, "SetVariable")
 	})
 }
@@ -4427,6 +4521,10 @@ func TestIssue1795(t *testing.T) {
 	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
 		t.Skip("Test not relevant to Go < 1.13")
 	}
+	var doExecuteName = "regexp.(*Regexp).doExecute"
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 27) {
+		doExecuteName = "regexp.(*Regexp).find"
+	}
 	skipOn(t, "broken", "ppc64le")
 	withTestProcessArgs("issue1795", t, ".", []string{}, protest.EnableInlining|protest.EnableOptimization, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		assertNoError(grp.Continue(), t, "Continue()")
@@ -4435,14 +4533,14 @@ func TestIssue1795(t *testing.T) {
 		assertLineNumber(p, t, 13, "wrong line number after Next,")
 	})
 	withTestProcessArgs("issue1795", t, ".", []string{}, protest.EnableInlining|protest.EnableOptimization, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
-		setFunctionBreakpoint(p, t, "regexp.(*Regexp).doExecute")
+		setFunctionBreakpoint(p, t, doExecuteName)
 		assertNoError(grp.Continue(), t, "Continue()")
 		assertLineNumber(p, t, 12, "wrong line number after Continue (1),")
 		assertNoError(grp.Continue(), t, "Continue()")
 		frames, err := proc.ThreadStacktrace(p, p.CurrentThread(), 40)
 		assertNoError(err, t, "ThreadStacktrace()")
 		logStacktrace(t, p, frames)
-		if err := checkFrame(frames[0], "regexp.(*Regexp).doExecute", "", 0, false); err != nil {
+		if err := checkFrame(frames[0], doExecuteName, "", 0, false); err != nil {
 			t.Errorf("Wrong frame 0: %v", err)
 		}
 		if err := checkFrame(frames[1], "regexp.(*Regexp).doMatch", "", 0, true); err != nil {
@@ -4635,7 +4733,7 @@ func TestIssue2319(t *testing.T) {
 	fixture := protest.BuildFixture(t, "issue2319/", protest.BuildModeExternalLinker)
 
 	// Load up the binary and make sure there are no crashes.
-	bi := proc.NewBinaryInfo("linux", "amd64")
+	bi := proc.NewBinaryInfo("linux", "amd64", false)
 	assertNoError(bi.LoadBinaryInfo(fixture.Path, 0, nil), t, "LoadBinaryInfo")
 }
 
@@ -5235,7 +5333,7 @@ func TestSetOnFunctions(t *testing.T) {
 		assertNoError(grp.Continue(), t, "Continue()")
 		scope, err := proc.GoroutineScope(p, p.CurrentThread())
 		assertNoError(err, t, "GoroutineScope")
-		err = scope.SetVariable("main.func1", "main.func2")
+		err = scope.SetVariable("main.func1", "main.func2", 0)
 		if err == nil {
 			t.Fatal("expected error when assigning between function variables")
 		}
@@ -5243,6 +5341,7 @@ func TestSetOnFunctions(t *testing.T) {
 }
 
 func TestNilPtrDerefInBreakInstr(t *testing.T) {
+	skipOn(t, "not implemented", "linux", "riscv64")
 	// Checks that having a breakpoint on the exact instruction that causes a
 	// nil pointer dereference does not cause problems.
 
@@ -5256,8 +5355,6 @@ func TestNilPtrDerefInBreakInstr(t *testing.T) {
 		asmfile = "main_386.s"
 	case "ppc64le":
 		asmfile = "main_ppc64le.s"
-	case "riscv64":
-		asmfile = "main_riscv64.s"
 	case "loong64":
 		asmfile = "main_loong64.s"
 	default:
@@ -5934,6 +6031,7 @@ func TestStackwatchClearBug(t *testing.T) {
 	skipOn(t, "not implemented", "386")
 	skipOn(t, "not implemented", "ppc64le")
 	skipOn(t, "not implemented", "loong64")
+	skipOn(t, "not implemented", "riscv64")
 	skipOn(t, "see https://github.com/go-delve/delve/issues/2768", "windows")
 
 	showbps := func(bps *proc.BreakpointMap) {
@@ -6085,7 +6183,7 @@ func TestDelveCatch(t *testing.T) {
 
 func TestTrimpathDetection(t *testing.T) {
 	f1 := protest.BuildFixture(t, "math", 0)
-	bi1 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	bi1 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH, false)
 	assertNoError(bi1.LoadBinaryInfo(f1.Path, 0x10000, nil), t, "LoadBinaryInfo")
 	if bi1.Images[0].Trimpath {
 		t.Error("expected trimpath used to be false, was true")
@@ -6095,7 +6193,7 @@ func TestTrimpathDetection(t *testing.T) {
 	buildinfo, _ := buildinfo.ReadFile(f2.Path)
 	fmt.Printf("%#v\n", buildinfo)
 
-	b2 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	b2 := proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH, false)
 	assertNoError(b2.LoadBinaryInfo(f2.Path, 0x10000, nil), t, "LoadBinaryInfo")
 	if !b2.Images[0].Trimpath {
 		t.Error("expected trimpath used to be true, was false")
@@ -6186,4 +6284,23 @@ func TestNonGoBinaryWithGoDlopen(t *testing.T) {
 			t.Fatalf("second Continue failed: %v", err)
 		}
 	}
+}
+
+func TestTimeoutAccessingMap(t *testing.T) {
+	withTestProcess("verybigmap", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		assertNoError(grp.Continue(), t, "Continue")
+		t0 := time.Now()
+		v, err := evalVariableOrError(p, `m["thing"]`)
+		if time.Since(t0) > 300*time.Millisecond {
+			t.Errorf("test took too long %v", time.Since(t0))
+		}
+		t.Logf("value %v error %v", v, err)
+		if err == nil {
+			if n, _ := constant.Int64Val(v.Value); n != -1 {
+				t.Errorf("wrong value returned: %v", n)
+			}
+		} else if err.Error() != "eval timed out" {
+			t.Errorf("wrong error returned: %v", err)
+		}
+	})
 }

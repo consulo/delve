@@ -9,7 +9,7 @@ apt-get -qq update
 if [ "$arch" = "ppc64le" ]; then
 	apt-get install --no-upgrade -y wget jq
 else
-	apt-get install --no-upgrade -y gcc wget jq lsof
+	apt-get install --no-upgrade -y gcc wget jq lsof procps
 fi
 
 
@@ -58,7 +58,7 @@ export GOPATH
 export PATH=$PATH:$GOROOT/bin:$GOPATH/bin
 go version
 if [ "$arch" != "ppc64le" ]; then
-	go install honnef.co/go/tools/cmd/staticcheck@2025.1.1 || true
+	go install honnef.co/go/tools/cmd/staticcheck@2026.2rc1 || true
 fi
 
 go install github.com/google/capslock/cmd/capslock@latest
@@ -87,8 +87,17 @@ fi
 set +e
 go run _scripts/make.go test
 x=$?
+
+fuzz_x=0
+if [ "$arch" = "amd64" ]; then
+	_scripts/fuzz_eval_expression.sh seed
+	fuzz_x=$?
+fi
+
 if [ "$version" = "gotip" ]; then
 	exit 0
+elif [ "$x" -ne 0 ]; then
+	exit "$x"
 else
-	exit $x
+	exit "$fuzz_x"
 fi

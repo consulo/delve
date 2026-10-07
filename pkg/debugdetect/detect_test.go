@@ -2,6 +2,7 @@ package debugdetect
 
 import (
 	"bufio"
+	"bytes"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,19 @@ import (
 	protest "github.com/go-delve/delve/pkg/proc/test"
 	"github.com/go-delve/delve/service/rpc2"
 )
+
+func scanForListenAddr(t *testing.T, scanner *bufio.Scanner, stderr *bytes.Buffer) string {
+	t.Helper()
+	const marker = " server listening at: "
+	for scanner.Scan() {
+		line := scanner.Text()
+		if idx := strings.Index(line, marker); idx >= 0 {
+			return line[idx+len(marker):]
+		}
+	}
+	t.Fatalf("dlv exited without printing listen address (stderr: %s)", stderr.String())
+	return ""
+}
 
 func TestIntegration_NotAttached(t *testing.T) {
 	// Build the fixture
@@ -49,8 +63,9 @@ func TestIntegration_WaitForDebugger(t *testing.T) {
 	fixturesDir := protest.FindFixturesDir()
 	fixtureSrc := filepath.Join(fixturesDir, "waitfordebugger.go")
 
-	const listenAddr = "127.0.0.1:40581"
-	cmd := exec.Command(dlvbin, "debug", fixtureSrc, "--headless", "--continue", "--accept-multiclient", "--listen", listenAddr)
+	cmd := exec.Command(dlvbin, "debug", fixtureSrc, "--headless", "--continue", "--accept-multiclient", "--listen", "127.0.0.1:0")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -61,8 +76,9 @@ func TestIntegration_WaitForDebugger(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Read stdout until we see the program output
 	scanner := bufio.NewScanner(stdout)
+	listenAddr := scanForListenAddr(t, scanner, &stderr)
+
 	foundOutput := false
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -95,8 +111,9 @@ func TestIntegration_Attached(t *testing.T) {
 
 	// Run the fixture under dlv debug with --headless --continue
 	// This will attach the debugger, compile and run the program
-	const listenAddr = "127.0.0.1:40580"
-	cmd := exec.Command(dlvbin, "debug", fixtureSrc, "--headless", "--continue", "--accept-multiclient", "--listen", listenAddr)
+	cmd := exec.Command(dlvbin, "debug", fixtureSrc, "--headless", "--continue", "--accept-multiclient", "--listen", "127.0.0.1:0")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -107,8 +124,9 @@ func TestIntegration_Attached(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Read stdout until we see the program output
 	scanner := bufio.NewScanner(stdout)
+	listenAddr := scanForListenAddr(t, scanner, &stderr)
+
 	foundOutput := false
 	for scanner.Scan() {
 		line := scanner.Text()

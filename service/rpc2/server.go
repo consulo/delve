@@ -145,10 +145,14 @@ func (s *RPCServer) Command(command api.DebuggerCommand, cb service.RPCCallback)
 }
 
 func (s *RPCServer) eventsFn(event *proc.Event) {
-	s.eventsChan <- event
+	select {
+	case s.eventsChan <- event:
+	default:
+	}
 }
 
 type GetBufferedTracepointsIn struct {
+	LoadCfg *api.LoadConfig
 }
 
 type GetBufferedTracepointsOut struct {
@@ -156,7 +160,7 @@ type GetBufferedTracepointsOut struct {
 }
 
 func (s *RPCServer) GetBufferedTracepoints(arg GetBufferedTracepointsIn, out *GetBufferedTracepointsOut) error {
-	out.TracepointResults = s.debugger.GetBufferedTracepoints()
+	out.TracepointResults = s.debugger.GetBufferedTracepoints(arg.LoadCfg)
 	return nil
 }
 
@@ -208,7 +212,8 @@ type StacktraceOut struct {
 func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 	cfg := arg.Cfg
 	if cfg == nil && arg.Full {
-		cfg = &api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+		full := proc.LoadFullValue()
+		cfg = api.LoadConfigFromProc(&full)
 	}
 	if arg.Defers {
 		arg.Opts |= api.StacktraceReadDefers
@@ -284,6 +289,31 @@ func (s *RPCServer) CreateBreakpoint(arg CreateBreakpointIn, out *CreateBreakpoi
 		return err
 	}
 	out.Breakpoint = *createdbp
+	return nil
+}
+
+type SetExecutionPointIn struct {
+	// Addr is the address of the instruction to jump to.
+	Addr uint64
+}
+
+type SetExecutionPointOut struct {
+	State api.DebuggerState
+}
+
+// SetExecutionPoint sets the next instruction to be executed by the current
+// thread to the instruction at arg.Addr, without executing any of the
+// instructions in between (also known as "set next statement" or "jump"). The
+// target address must be inside the function the current thread is stopped in.
+func (s *RPCServer) SetExecutionPoint(arg SetExecutionPointIn, out *SetExecutionPointOut) error {
+	if err := s.debugger.SetExecutionPoint(arg.Addr); err != nil {
+		return err
+	}
+	state, err := s.debugger.State(false)
+	if err != nil {
+		return err
+	}
+	out.State = *state
 	return nil
 }
 
@@ -552,7 +582,8 @@ type EvalOut struct {
 func (s *RPCServer) Eval(arg EvalIn, out *EvalOut) error {
 	cfg := arg.Cfg
 	if cfg == nil {
-		cfg = &api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+		full := proc.LoadFullValue()
+		cfg = api.LoadConfigFromProc(&full)
 	}
 	pcfg := *api.LoadConfigToProc(cfg)
 	v, err := s.debugger.EvalVariableInScope(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Expr, pcfg)
@@ -564,9 +595,10 @@ func (s *RPCServer) Eval(arg EvalIn, out *EvalOut) error {
 }
 
 type SetIn struct {
-	Scope  api.EvalScope
-	Symbol string
-	Value  string
+	Scope   api.EvalScope
+	Symbol  string
+	Value   string
+	Timeout int // timeout in milliseconds, defaults to 100 milliseconds.
 }
 
 type SetOut struct {
@@ -575,7 +607,7 @@ type SetOut struct {
 // Set sets the value of a variable. Only numerical types and
 // pointers are currently supported.
 func (s *RPCServer) Set(arg SetIn, out *SetOut) error {
-	return s.debugger.SetVariableInScope(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Symbol, arg.Value)
+	return s.debugger.SetVariableInScope(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Symbol, arg.Value, arg.Timeout)
 }
 
 type ListSourcesIn struct {
@@ -1222,13 +1254,24 @@ func (s *RPCServer) CancelDownloads(arg CancelDownloadsIn, cb service.RPCCallbac
 
 type DownloadLibraryDebugInfoIn struct {
 	N int
+	// WithEvents specifies that download events, similar to the ones produced
+	// by Command are emitted.
+	// A client specifying WithEvents is responsible for repeatedly calling
+	// GetEvents until a EventDownloadLibraryInfoDone is seen.
+	WithEvents bool
 }
 
 type DownloadLibraryDebugInfoOut struct {
 }
 
-func (s *RPCServer) DownloadLibraryDebugInfo(arg DownloadLibraryDebugInfoIn, out DownloadLibraryDebugInfoOut) error {
-	return s.debugger.DownloadLibraryDebugInfo(arg.N)
+func (s *RPCServer) DownloadLibraryDebugInfo(arg DownloadLibraryDebugInfoIn, cb service.RPCCallback) {
+	close(cb.SetupDoneChan())
+	eventsFn := s.eventsFn
+	if !arg.WithEvents {
+		eventsFn = nil
+	}
+	err := s.debugger.DownloadLibraryDebugInfo(arg.N+1, eventsFn)
+	cb.Return(new(DownloadLibraryDebugInfoOut), err)
 }
 
 type TypeInfoIn struct {

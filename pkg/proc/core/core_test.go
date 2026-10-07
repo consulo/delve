@@ -10,13 +10,16 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/test"
+	"golang.org/x/text/encoding/unicode"
 )
 
 var buildMode string
@@ -198,7 +201,7 @@ func TestSplicedReader(t *testing.T) {
 	}
 }
 
-func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
+func withCoreFile(t *testing.T, name, args string) (*proc.TargetGroup, []byte) {
 	// This is all very fragile and won't work on hosts with non-default core patterns.
 	// Might be better to check in the binary and core?
 	tempDir := t.TempDir()
@@ -208,7 +211,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 	}
 	fix := test.BuildFixture(t, name, buildFlags)
 	bashCmd := fmt.Sprintf("cd %v && ulimit -c unlimited && GOTRACEBACK=crash %v %s", tempDir, fix.Path, args)
-	exec.Command("bash", "-c", bashCmd).Run()
+	output, _ := exec.Command("bash", "-c", bashCmd).CombinedOutput()
 	cores, err := filepath.Glob(path.Join(tempDir, "core*"))
 	switch {
 	case err != nil || len(cores) > 1:
@@ -218,7 +221,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 		err := exec.Command("coredumpctl", "--output="+cores[0], "dump", fix.Path).Run()
 		if err != nil {
 			t.Skipf("core file was not produced, could not run test, coredumpctl error: %v", err)
-			return nil
+			return nil, nil
 		}
 		test.AddPathToRemove(cores[0])
 	}
@@ -233,7 +236,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 		t.Errorf("read apport log: %q, %v", apport, err)
 		t.Fatalf("previous errors")
 	}
-	return p
+	return p, output
 }
 
 func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
@@ -254,7 +257,7 @@ func TestCore(t *testing.T) {
 
 	mustSupportCore(t)
 
-	grp := withCoreFile(t, "panic", "")
+	grp, _ := withCoreFile(t, "panic", "")
 	p := grp.Selected
 
 	recorded, _ := grp.Recorded()
@@ -317,6 +320,58 @@ func TestCore(t *testing.T) {
 	logRegisters(t, regs, p.BinInfo().Arch)
 }
 
+// TestCoreCGOAssert verifies that C function frames appear in core dump backtraces.
+// Issue #3322: the crash frame (C.test1) is missing when assert() crashes in CGO code.
+func TestCoreCGOAssert(t *testing.T) {
+	t.Parallel()
+	mustSupportCore(t)
+
+	grp, _ := withCoreFile(t, "cgocoreassert", "")
+	p := grp.Selected
+
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
+	if err != nil || len(gs) == 0 {
+		t.Fatalf("GoroutinesInfo() = %v, %v; wanted at least one goroutine", gs, err)
+	}
+
+	// Find the goroutine running main.main and check its stack for C frames.
+	var mainStack []proc.Stackframe
+	for _, g := range gs {
+		stack, err := proc.GoroutineStacktrace(p, g, 20, 0)
+		if err != nil {
+			t.Errorf("Stacktrace() on goroutine %v = %v", g, err)
+			continue
+		}
+		for _, frame := range stack {
+			if frame.Call.Fn != nil && frame.Call.Fn.Name == "main.main" {
+				mainStack = stack
+				break
+			}
+		}
+		if mainStack != nil {
+			break
+		}
+	}
+	if mainStack == nil {
+		t.Fatal("could not find main goroutine")
+	}
+
+	found := make(map[string]bool)
+	for _, frame := range mainStack {
+		if frame.Call.Fn != nil {
+			found[frame.Call.Fn.Name] = true
+		}
+	}
+
+	// Issue #3322: C.test1 (where assert(0) is called) is missing from the
+	// backtrace. C.test2 and C.test3 are resolved correctly.
+	for _, name := range []string{"C.test1", "C.test2", "C.test3"} {
+		if !found[name] {
+			t.Errorf("C function frame %q missing from backtrace (issue #3322)", name)
+		}
+	}
+}
+
 func TestCoreFpRegisters(t *testing.T) {
 	t.Parallel()
 	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
@@ -331,7 +386,7 @@ func TestCoreFpRegisters(t *testing.T) {
 		t.Skip("not supported in go1.10 and later")
 	}
 
-	grp := withCoreFile(t, "fputest/", "panic")
+	grp, _ := withCoreFile(t, "fputest/", "panic")
 	p := grp.Selected
 
 	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
@@ -412,7 +467,7 @@ func TestCoreWithEmptyString(t *testing.T) {
 	t.Parallel()
 	mustSupportCore(t)
 
-	grp := withCoreFile(t, "coreemptystring", "")
+	grp, _ := withCoreFile(t, "coreemptystring", "")
 	p := grp.Selected
 
 	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
@@ -436,7 +491,7 @@ mainSearch:
 	}
 
 	scope := proc.FrameToScope(p, p.Memory(), nil, p.CurrentThread().ThreadID(), *mainFrame)
-	loadConfig := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+	loadConfig := proc.LoadFullValue()
 	v1, err := scope.EvalExpression("t", loadConfig)
 	assertNoError(err, t, "EvalVariable(t)")
 	assertNoError(v1.Unreadable, t, "unreadable variable 't'")
@@ -505,8 +560,9 @@ func procdump(t *testing.T, exePath string) string {
 	exeDir := filepath.Dir(exePath)
 	cmd := exec.Command("procdump64", "-accepteula", "-ma", "-n", "1", "-s", "3", "-x", exeDir, exePath, "quit")
 	out, err := cmd.CombinedOutput() // procdump exits with non-zero status on success, so we have to ignore the error here
-	if !strings.Contains(string(out), "Dump count reached.") {
-		t.Fatalf("possible error running procdump64, output: %q, error: %v", string(out), err)
+	outStr := decodeProcdumpOutput(out)
+	if !strings.Contains(outStr, "Dump count reached.") {
+		t.Fatalf("possible error running procdump64, output: %q, error: %v", outStr, err)
 	}
 
 	fis, err := os.ReadDir(exeDir)
@@ -529,6 +585,20 @@ func procdump(t *testing.T, exePath string) string {
 	return ""
 }
 
+// decodeProcdumpOutput handles procdump64 output which may be UTF-16LE encoded.
+func decodeProcdumpOutput(out []byte) string {
+	s := string(out)
+	if strings.Contains(s, "Dump count reached.") {
+		return s
+	}
+	// ProcDump v12.01+ may produce UTF-16LE output.
+	decoder := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
+	if decoded, err := decoder.Bytes(out); err == nil {
+		return string(decoded)
+	}
+	return s
+}
+
 func mustSupportCore(t *testing.T) {
 	t.Helper()
 
@@ -543,5 +613,76 @@ func mustSupportCore(t *testing.T) {
 
 	if os.Getenv("CI") == "true" && buildMode == "pie" {
 		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
+	}
+}
+
+// parseIssue3591RuntimeModMapSP parses runtime's SP for main.mod_map from panic output.
+func parseIssue3591RuntimeModMapSP(stderr []byte) (uint64, error) {
+	i := bytes.Index(stderr, []byte("main.mod_map("))
+	if i < 0 {
+		return 0, fmt.Errorf("main.mod_map not found in panic output:\n%s", stderr)
+	}
+	window := stderr[i:]
+	if len(window) > 2048 {
+		window = window[:2048]
+	}
+	m := regexp.MustCompile(`sp=(0x[0-9a-f]+)`).FindSubmatch(window)
+	if len(m) < 2 {
+		return 0, fmt.Errorf("sp= not found after main.mod_map in panic output:\n%s", window)
+	}
+	return strconv.ParseUint(string(m[1])[2:], 16, 64)
+}
+
+// TestIssue3591_CoreModMapFrameSP verifies Delve reports the same SP as the
+// Go runtime for sigpanic frames in linux/arm64 core dumps.
+func TestIssue3591_CoreModMapFrameSP(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "arm64" {
+		t.Skip("issue #3591 reproduces on linux/arm64 ELF cores only")
+	}
+	mustSupportCore(t)
+
+	grp, stderr := withCoreFile(t, "issue3591", "")
+	p := grp.Selected
+
+	wantSP, err := parseIssue3591RuntimeModMapSP(stderr)
+	if err != nil {
+		t.Fatalf("%v\n--- crash output ---\n%s", err, stderr)
+	}
+
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
+	if err != nil || len(gs) == 0 {
+		t.Fatalf("GoroutinesInfo: err=%v n=%d", err, len(gs))
+	}
+	var g *proc.G
+	for _, gi := range gs {
+		if gi.ID == 1 {
+			g = gi
+			break
+		}
+	}
+	if g == nil {
+		t.Fatalf("goroutine 1 not found among %d goroutines", len(gs))
+	}
+
+	stack, err := proc.GoroutineStacktrace(p, g, 80, 0)
+	if err != nil {
+		t.Fatalf("GoroutineStacktrace: %v", err)
+	}
+	var modMap *proc.Stackframe
+	for i := range stack {
+		fn := stack[i].Current.Fn
+		if fn != nil && fn.Name == "main.mod_map" {
+			modMap = &stack[i]
+			break
+		}
+	}
+	if modMap == nil {
+		t.Fatalf("main.mod_map not in stack (%d frames)", len(stack))
+	}
+
+	gotSP := uint64(modMap.Regs.SP())
+	if gotSP != wantSP {
+		t.Fatalf("issue #3591: main.mod_map frame SP mismatch: delve=%#x runtime=%#x (see panic.txt in test temp dir pattern)",
+			gotSP, wantSP)
 	}
 }

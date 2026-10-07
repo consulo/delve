@@ -12,6 +12,7 @@ Command | Description
 --------|------------
 [call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
 [continue](#continue) | Run until breakpoint or program termination.
+[jump](#jump) | Set the next instruction to be executed (EXPERIMENTAL!!!).
 [next](#next) | Step over to next source line.
 [next-instruction](#next-instruction) | Single step a single cpu instruction, skipping function calls.
 [rebuild](#rebuild) | Rebuild the target executable and restarts it. It does not work if the executable was not built by delve.
@@ -254,7 +255,7 @@ Saves the configuration file to disk, overwriting the current configuration file
 
 Changes the value of simple configuration parameters.
 
-Use 'help config &lt;parameter>' for more informations on specific configuration options.
+Use 'help config &lt;parameter>' for more information on specific configuration options.
 
 
 
@@ -355,9 +356,11 @@ Aliases: x
 ## exit
 Exit the debugger.
 
-	exit [-c]
+	exit [-c] [-d]
 
 When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.
+
+Pass -d to detach from the target process, leaving it running, without being prompted whether to kill it.
 
 Aliases: quit q
 
@@ -490,6 +493,23 @@ Prints the help message.
 Type "help" followed by the name of a command for more information about it.
 
 Aliases: h
+
+## jump
+Set the next instruction to be executed (EXPERIMENTAL!!!).
+
+	jump <linespec>
+
+Sets the next instruction to be executed to the location given by &lt;linespec>,
+without executing any of the instructions in between (also known as "set next
+statement"). The target must be inside the current function.
+
+WARNING: this is unsafe. Even with optimizations disabled the compiler
+reorders instructions and inserts hidden initialization, so skipping over code
+can skip setup that later instructions rely on.
+
+See also: "help locspec".
+
+Aliases: j
 
 ## libraries
 List loaded dynamic libraries.
@@ -776,7 +796,7 @@ Set watchpoint.
 
 The memory location is specified with the same expression language used by 'print', for example:
 
-	watch v
+	watch -r v
 	watch -w *(*int)(0x1400007c018)
 
 will watch the address of variable 'v' and writes to an int at addr '0x1400007c018'.

@@ -3,6 +3,112 @@
 All notable changes to this project will be documented in this file.
 This project adheres to Semantic Versioning.
 
+## [1.27.2] 2026-09-08
+
+### Added
+
+- `jump` command and `SetExecutionPoint` API to set the next statement to be executed (#4434, @larrasket)
+- `types` command in DAP, mirroring the command-line REPL (#4439, @larrasket)
+- Emit download events while calling `DownloadLibraryDebugInfo`, and call it automatically after an attach (#4438, @aarzilli)
+
+### Fixed
+
+- Fix infinite loop in `mapIteratorSwiss.next` when the table length overflows (#4433, @aarzilli)
+- Do not call debuginfod-find right after attach, where the pause can not be reported or aborted (#4431, @aarzilli)
+- Poll wait4 on FreeBSD to avoid a lost wakeup that hung the debugger (#4435, @neilpang)
+- Advance through FreeBSD process snapshots instead of rescanning a cached entry (#4421, @typesanitizer)
+- Honor the frame and goroutine of the SetVariable scope in DAP (#4419, @larrasket)
+- Close resumeNotify early with the halt command so asynchronous requests can still be served (#4425, @aarzilli)
+- Defer pointer cast to the syscall invoking function on Windows (#4414, @typesanitizer)
+- Do not nest memCache objects (#4418, @aarzilli)
+- Format versioned development builds correctly (#4445, @cuishuang)
+- Keep `-C` first for test builds (#4444, @cuishuang)
+
+### Changed
+
+- Update `github.com/cilium/ebpf` from 0.11.0 to 0.22.0 (#4422, @dependabot)
+- Export `LoadFullValue` as a return-by-value helper and deduplicate matching `LoadConfig` literals (#4411, @derekparker)
+- Update Windows syscall generator (#4404, @typesanitizer)
+- Run the FreeBSD tests on GitHub Actions, replacing the shut down Cirrus CI (#4432, @neilpang)
+- Add scripts to set up and run the expression evaluator fuzzer, and run it in CI (#4412, @derekparker)
+- Upgrade GitHub Actions and pin GoReleaser (#4427, @derekparker, @FranciscoPombal)
+- Pin GitHub Actions to commit SHAs, declare workflow permissions, and add a plumber workflow security check (#4405, #4406, @Totara-thib)
+- Make interrupted draft uploads rerunnable and fail early when a release is already published (#4408, #4409, @FranciscoPombal)
+- Miscellaneous improvements to tests and build configuration (#4417, #4424, #4426, #4428, #4441, @aarzilli, @derekparker, @loongson-zn)
+
+## [1.27.1] 2026-07-31
+
+### Added
+
+- Option to display expanded/raw strings in DAP and terminal (#4395, @hitzhangjie)
+- `exit -d` to detach without killing the process (#4387, @larrasket)
+- Configurable variable load limits in DAP (#4385, @larrasket)
+- Support for `DW_CFA_GNU_args_size` CFA opcode (#4392, @minhbq-99)
+
+### Fixed
+
+- Fix arm64 crosscall2 SP restore for cgo stacktraces (#4399, @derekparker)
+- Set type in DAP SetVariable response (#4397, @larrasket)
+- Check error after executing CFA opcode (#4391, @minhbq-99)
+- Fix watch command documentation (#4390, @aarzilli)
+- Widen windows/arm64 frame-pointer unwinding guard (#4388, @derekparker)
+- Flush instruction cache after writing memory on Windows/ARM64 (#4383, @derekparker)
+- Fix panic on follow-exec process exit (#4383, @derekparker)
+- Send InvalidatedEvent after SetVariable and WriteMemory (#4384, @DrSergei)
+- Fix C frame attribution for noreturn calls in stack unwinding (#4374, @alexsaezm)
+
+### Changed
+
+- Update disassembler dependency (#4379, @aarzilli)
+- Ignore unsupported windows/arm64 architecture in goreleaser (#4381, @FranciscoPombal)
+- Miscellaneous improvements to tests and build configuration (#4400, #4396, #4394, #4393, #4382, #4378, #4377, @derekparker, @aarzilli)
+
+## [1.27.0] 2026-06-19
+
+### Added
+
+- Support for `GOEXPERIMENT=mapsplitgroup` (#4370, @prattmic, @aarzilli)
+- Support for generic methods (#4356, @aarzilli)
+- Frame pointer unwinding (#4288, @alexsaezm)
+- DAP: Write memory request handler (#4364, @DrSergei)
+
+### Fixed
+
+- Send `ExitedEvent` before `TerminatedEvent` in DAP (#4371, @derekparker)
+- Fix `hasInlines` in stacktrace, fix range step with inlining (#4345, @aarzilli)
+- Fix range over func stepping for go1.27 (#4343, @aarzilli)
+- Make `PushPackageVarOrSelect` check local variables first (#4181, @aarzilli)
+- Fix OR handling in `breakpointConditionSatisfiable` (#4325, @cuiweixie)
+- Fix SP calculation for sigpanic frames on arm64 (#4319, @alexsaezm)
+- Fix `AddressToOffset` off-by-one at eBPF section load (#4324, @cuiweixie)
+- Bail out of `loadArrayValues` after stride overflow (#4328, @cuiweixie)
+- Propagate errors during DWARF Reader entry iteration (#4327, @cuiweixie)
+- Propagate `AddrPiece` `ReadMemory` errors in composite memory (#4323, @cuiweixie)
+- Propagate ptrace register errors on linux/ppc64le (#4322, #4321, @cuiweixie)
+- Add newline to DAP build message (#4340, @sagg0t)
+
+### Changed
+
+- Switch to header+param event ring buffer protocol for eBPF tracing (#4352, @derekparker)
+- Revert removal of experimental build tags for windows/arm64 (#4281, @aarzilli)
+- Compile hit-condition regexp once (#4335, @cuiweixie)
+- Miscellaneous improvements to tests, build configuration, and code readability (#4317, #4339, #4344, #4346, #4350, #4351, #4354, #4358, #4359, #4361, #4362, #4365, #4367, @aarzilli, @alexsaezm, @box4wangjing, @cuoguojida, @typesanitizer, @vietage)
+
+## [1.26.3] 2026-04-27
+
+### Added
+
+- Print function arguments when using eBPF for tracing (#4305, @archanaravindar)
+
+### Fixed
+
+- Fix regression debugging DWARFv5 executables that use debug_line_str section on macOS (#4315, @aarzilli)
+- Fix printing wait reason of channels (#4307, @croepha)
+
+### Changed
+
+- Miscellaneous documentation and test improvements (#4316, #4306, @purelualight, @typesanitizer)
+
 ## [1.26.2] 2026-04-20
 
 ### Added

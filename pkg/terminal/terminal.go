@@ -21,6 +21,7 @@ import (
 	"github.com/go-delve/delve/pkg/config"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/locspec"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
 	"github.com/go-delve/delve/service"
@@ -72,9 +73,16 @@ type Term struct {
 
 	substitutePathRulesCache [][2]string
 
+	// isAttachCmd is true if this terminal was stated by 'dlv attach...'
+	isAttachCmd bool
+
 	// quitContinue is set to true by exitCommand to signal that the process
 	// should be resumed before quitting.
 	quitContinue bool
+
+	// detachNoKill is set to true by exitCommand when passed -d to signal that
+	// the target process should be left running, without prompting.
+	detachNoKill bool
 
 	longCommandMu         sync.Mutex
 	longCommandCancelFlag bool
@@ -99,7 +107,7 @@ type displayEntry struct {
 }
 
 // New returns a new Term.
-func New(client service.Client, conf *config.Config) *Term {
+func New(client service.Client, conf *config.Config, isAttachCmd bool) *Term {
 	cmds := DebugCommands(client)
 	if conf != nil && conf.Aliases != nil {
 		cmds.Merge(conf.Aliases)
@@ -115,6 +123,8 @@ func New(client service.Client, conf *config.Config) *Term {
 		line:   liner.NewLiner(),
 		cmds:   cmds,
 		stdout: &transcriptWriter{pw: &pagingWriter{w: os.Stdout}},
+
+		isAttachCmd: isAttachCmd,
 	}
 	t.line.SetCtrlZStop(true)
 
@@ -149,13 +159,14 @@ func New(client service.Client, conf *config.Config) *Term {
 				}
 				fmt.Fprintf(t.stdout, "Downloading debug info for %s: %s (press ^C to cancel)", event.BinaryInfoDownloadEventDetails.ImagePath, event.BinaryInfoDownloadEventDetails.Progress)
 				firstEventBinaryInfoDownload = false
-			case api.EventStopped:
+			case api.EventStopped, api.EventDownloadLibraryInfoDone:
 				t.downloadsMu.Lock()
 				t.downloadsInProgress = false
 				t.downloadsMu.Unlock()
 				if !firstEventBinaryInfoDownload {
 					fmt.Fprintf(t.stdout, "\n")
 				}
+				firstEventBinaryInfoDownload = true
 			case api.EventBreakpointMaterialized:
 				bp := event.BreakpointMaterializedEventDetails.Breakpoint
 				file := t.formatPath(bp.File)
@@ -411,6 +422,10 @@ func (t *Term) Run() (int, error) {
 	// making a blocking call.
 	_, _ = t.client.GetState()
 
+	if t.isAttachCmd {
+		t.client.DownloadLibraryDebugInfo(-1)
+	}
+
 	for {
 		locs = nil
 
@@ -593,12 +608,15 @@ func (t *Term) handleExit() (int, error) {
 
 		if doDetach {
 			kill := true
-			if t.client.AttachedToExistingProcess() {
+			if t.client.AttachedToExistingProcess() && !t.detachNoKill {
 				answer, err := yesno(t.line, "Would you like to kill the process? [Y/n] ", "yes")
 				if err != nil {
 					return 2, io.EOF
 				}
 				kill = answer
+			}
+			if t.detachNoKill {
+				kill = false
 			}
 			if err := t.client.Detach(kill); err != nil {
 				return 1, err
@@ -611,19 +629,34 @@ func (t *Term) handleExit() (int, error) {
 // loadConfig returns an api.LoadConfig with the parameters specified in
 // the configuration file.
 func (t *Term) loadConfig() api.LoadConfig {
-	r := api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+	full := proc.LoadFullValue()
+	r := *api.LoadConfigFromProc(&full)
+	if t.conf == nil {
+		return r
+	}
 
-	if t.conf != nil && t.conf.MaxStringLen != nil {
+	if t.conf.MaxStringLen != nil {
 		r.MaxStringLen = *t.conf.MaxStringLen
 	}
-	if t.conf != nil && t.conf.MaxArrayValues != nil {
+	if t.conf.MaxArrayValues != nil {
 		r.MaxArrayValues = *t.conf.MaxArrayValues
 	}
-	if t.conf != nil && t.conf.MaxVariableRecurse != nil {
+	if t.conf.MaxVariableRecurse != nil {
 		r.MaxVariableRecurse = *t.conf.MaxVariableRecurse
+	}
+	if t.conf.EvalTimeout != nil {
+		r.EvalTimeout = *t.conf.EvalTimeout
 	}
 
 	return r
+}
+
+// evalTimeout returns the expression evaluation timeout in milliseconds
+func (t *Term) evalTimeout() int {
+	if t.conf != nil && t.conf.EvalTimeout != nil {
+		return *t.conf.EvalTimeout
+	}
+	return 0
 }
 
 func (t *Term) removeDisplay(n int) error {
@@ -645,6 +678,14 @@ func (t *Term) addDisplay(expr, fmtstr string) {
 	t.displays = append(t.displays, displayEntry{expr: expr, fmtstr: fmtstr})
 }
 
+// rawStringFlag returns the PrettyRawString flag if the config enables it.
+func (t *Term) rawStringFlag() api.PrettyFlags {
+	if t.conf.ShowRawStrings {
+		return api.PrettyRawString
+	}
+	return 0
+}
+
 func (t *Term) printDisplay(i int) {
 	expr, fmtstr := t.displays[i].expr, t.displays[i].fmtstr
 	val, err := t.client.EvalVariable(api.EvalScope{GoroutineID: -1}, expr, ShortLoadConfig)
@@ -655,7 +696,7 @@ func (t *Term) printDisplay(i int) {
 		fmt.Fprintf(t.stdout, "%d: %s = error %v\n", i, expr, err)
 		return
 	}
-	fmt.Fprintf(t.stdout, "%d: %s = %s\n", i, val.Name, val.StringWithOptions("", fmtstr, 0))
+	fmt.Fprintf(t.stdout, "%d: %s = %s\n", i, val.Name, val.StringWithOptions("", fmtstr, t.rawStringFlag()))
 }
 
 func (t *Term) printDisplays() {

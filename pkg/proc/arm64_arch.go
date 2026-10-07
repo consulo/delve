@@ -49,6 +49,7 @@ func ARM64Arch(goos string) *Arch {
 		ContextRegNum:                    regnum.ARM64_X0 + 26,
 		LRRegNum:                         regnum.ARM64_LR,
 		asmRegisters:                     arm64AsmRegisters,
+		resolveCallTrampolineFn:          resolveARM64LinkerTrampoline,
 		RegisterNameToDwarf:              nameToDwarfFunc(regnum.ARM64NameToDwarf),
 		RegnumToString:                   regnum.ARM64ToName,
 		debugCallMinStackSize:            288,
@@ -238,7 +239,7 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 		return true
 
 	case "crosscall2":
-		// The offsets get from runtime/cgo/asm_arm64.s:10
+		// The offsets get from runtime/cgo/asm_arm64.s
 		bpoff := uint64(14)
 		lroff := uint64(15)
 		if producer := it.bi.Producer(); producer != "" && goversion.ProducerAfterOrEqual(producer, 1, 19) {
@@ -246,7 +247,10 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 			bpoff = 22
 			lroff = 23
 		}
-		newsp, _ := readUintRaw(it.mem, it.regs.SP()+8*24, int64(it.bi.Arch.PtrSize()))
+		// crosscall2 does SUB $(8*24), RSP but does not spill SP. The caller's SP is
+		// therefore current SP + 8*24, not a value loaded from that address (which is
+		// the caller's stack contents).
+		newsp := it.regs.SP() + 8*24
 		newbp, _ := readUintRaw(it.mem, it.regs.SP()+8*bpoff, int64(it.bi.Arch.PtrSize()))
 		newlr, _ := readUintRaw(it.mem, it.regs.SP()+8*lroff, int64(it.bi.Arch.PtrSize()))
 		if it.regs.Reg(it.regs.BPRegNum) != nil {
@@ -256,11 +260,7 @@ func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool 
 			it.regs.AddReg(it.regs.BPRegNum, reg)
 		}
 		it.regs.Reg(it.regs.LRRegNum).Uint64Val = newlr
-		if linux {
-			it.regs.Reg(it.regs.SPRegNum).Uint64Val = newbp
-		} else {
-			it.regs.Reg(it.regs.SPRegNum).Uint64Val = newsp
-		}
+		it.regs.Reg(it.regs.SPRegNum).Uint64Val = newsp
 		it.pc = newlr
 		return true
 	case "runtime.mstart":
