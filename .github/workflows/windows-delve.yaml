@@ -16,10 +16,13 @@ jobs:
             msvc_arch: x64
             pe_machine: x64
             runs_on: windows-2022
+            tags: ''
           - arch: aarch64
             msvc_arch: arm64
             pe_machine: ARM64
             runs_on: windows-11-arm
+            # still experimental in delve, like linux loong64/riscv64 - make.go adds the tag only for tests
+            tags: exp.winarm64
 
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -30,7 +33,7 @@ jobs:
           go-version-file: go.mod
 
       - name: build
-        run: go run _scripts/make.go build
+        run: go run _scripts/make.go build ${{ matrix.tags && format('--tags={0}', matrix.tags) || '' }}
 
       - name: Setup MSVC (${{ matrix.msvc_arch }})
         uses: ilammy/msvc-dev-cmd@v1
